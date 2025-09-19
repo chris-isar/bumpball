@@ -1,0 +1,2035 @@
+<!DOCTYPE html>
+<!-- saved from url=(0058)file:///C:/Users/Chris's%20RiGG/Desktop/Bumper%20Ball.html -->
+<html lang="en"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+  
+  <title>BumpBall</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- ========================= [HEADER & STYLES] ========================= -->
+  <style>
+    html, body { margin: 0; height: 100%; background: #0f1115; color: #e8e9ee;
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; overflow: hidden; }
+    .wrap { position: fixed; inset: 0; display: grid; place-items: center; }
+    canvas { display: block; image-rendering: auto; outline: 1px solid #222833; background: #0a0c10;
+      border-radius: 8px; box-shadow: 0 0 0 1px #0a0c10, 0 12px 40px rgba(0,0,0,.5); }
+    .hint { position: fixed; left: 12px; bottom: 10px; font-size: 12px; opacity: .65; user-select: none; }
+  </style>
+</head>
+<body>
+  <!-- ========================= [CANVAS ROOT] ========================= -->
+  <div class="wrap">
+    <canvas id="game" width="2880" height="1620" aria-label="Game canvas" style="width: 2273.78px; height: 1279px;"></canvas>
+  </div>
+  <div class="hint">Enter: start · R: restart · Arrows: Up/Down throttle, Left/Right steer</div>
+
+  <script>
+// ========================= [GAME: STATE & WORLD RES] =========================
+const INTERNAL_W = 1920, INTERNAL_H = 1080;
+const GameState = { Menu: 'menu', Playing: 'playing', Ended: 'ended' };
+let state = GameState.Menu;
+
+// substate & countdown tunables
+const PlayingSubstate = { Active: 0, Resetting: 1 };
+let playSubstate = PlayingSubstate.Active;
+
+const RESET_PAUSE_MS   = 2000; // 1500–2500 acceptable
+const COUNTDOWN_TICKS  = 3;    // show “3…2…1”
+
+// runtime countdown trackers
+let resetStartMs = 0;
+let resetEndsAt  = 0;
+
+// --- NEW: regulation timer & golden goal ---
+const MATCH_SECONDS = 10;
+let timeLeft = MATCH_SECONDS;
+let suddenDeath = false;
+let TIMER_PAUSED = false;
+const PLAYER_SIDE = 'left';
+let endBanner = '';
+
+// NEW: sudden-death overlay flash control
+const SUDDEN_DEATH_FLASH_MS = 2000; // show big overlay for ~2s
+let suddenDeathStartedAt = 0;       // timestamp when SD begins
+
+
+  // ========================= [CONSTANTS: ARENA & GOALS] =========================
+  const ARENA_W = 1600;
+  const ARENA_H = 800;
+  const WALL_THICKNESS = 24;
+  // Goal visuals (ball can exit through opening; car still treats side walls as solid)
+  const GOAL_H = Math.round(ARENA_H * 0.26);
+  const GOAL_W = Math.max(8, Math.round(WALL_THICKNESS * 0.6));
+  const GOAL_LEFT_COLOR  = '#2a9d8f';
+  const GOAL_RIGHT_COLOR = '#e76f51';
+
+ // ========================= [CONSTANTS: TIMESTEP & BALL] =========================
+const DT = 1/120;                    // fixed-step
+const FRICTION = 0.92;               // per-second linear drag for ball (tune 0.88–0.96)
+const ELASTICITY = 0.90;             // ball-wall restitution
+const STEP_FRICTION = Math.pow(FRICTION, DT); // ← applied every fixed step
+const GOAL_EPS = 0.01;          // plane epsilon to avoid edge flicker
+const GOAL_CORNER_GRACE = 12;    // px vertical grace around goal to prevent corner pop-outs
+// Ball launch speed range for post-reset vertical eject
+const MIN_Y_SPEED = 1;
+const MAX_Y_SPEED = 1000;
+// --- Anti-stick for ball near corners ---
+const CORNER_STUCK_SPEED      = 24;   // px/s; below this we consider the ball "stuck"
+const CORNER_STUCK_DIST       = 24;   // px from a corner to trigger
+const CORNER_KICK_SPEED       = 240;  // px/s kick magnitude
+const CORNER_KICK_SPEED_RAND  = 60;   // adds 0..N px/s randomness
+const CORNER_KICK_COOLDOWN_MS = 300;  // don't fire more often than this
+let lastCornerKickAt = 0;
+
+// --- Add: linger gate for ball corner detection ---
+const CORNER_STUCK_LINGER_MS = 240;  // must remain slow+in-zone this long before a kick
+let ballCornerStartMs = 0;           // tracks when ball first entered a corner zone
+
+
+// ========================= [CONSTANTS: CAR FEEL] =========================
+// Size / collider
+const CAR_RADIUS        = 66;
+
+// Acceleration / speed
+const CAR_ACCEL         = 1200;
+const CAR_REVERSE_ACCEL = 800;
+const CAR_MAX_SPEED     = 900;
+
+// Steering
+const CAR_TURN_RATE     = 6.0;
+const CAR_TURN_REFSPD   = 180;
+
+// Damping / slowdown
+const CAR_FRIC_LINEAR   = 0.85;
+const CAR_FRIC_ANG      = 0.45;
+const CAR_ROLLING_DECEL = 380;
+
+// Wall collisions
+const CAR_BOUNCE        = 0.84;
+const CAR_TANGENT_KEEP  = 0.88;
+const CAR_IMPULSE_PUSH  = 42;
+
+// Car–ball interaction
+const BALL_BOUNCE_CAR         = 0.90;
+const CAR_MASS                = 2.0;
+const BALL_MASS               = 1.0;
+const BALL_TANGENTIAL_COUPLING= 0.55;
+
+// New: scales extra "heading-aligned" push when the car is driving into the ball.
+// 0.0 = off, 0.3–0.6 = subtle to strong, keep ≤ 0.8 to avoid cartoon launches.
+const CAR_HEADING_BOOST       = 0.45;
+
+// Derived per-step damping
+const CAR_STEP_FRIC_LIN = Math.pow(CAR_FRIC_LINEAR, DT);
+const CAR_STEP_FRIC_ANG = Math.pow(CAR_FRIC_ANG, DT);
+// AI kickoff bias: charge the ball for a short window, no reversing
+const AI_KICKOFF_MS   = 600; // pursue ball aggressively for this many ms after countdown
+const AI_NO_REVERSE_MS= 500; // avoid reverse throttle during early pursuit window
+// Car–car knockback tuning (1 = baseline; 3–4 = much stronger hits)
+const CAR_CAR_KNOCKBACK = 3.6; // stronger shoves
+const CAR_HIT_HITTER_FACTOR = 0.15; 
+const CAR_HIT_VICTIM_GAIN   = 2.50;  
+
+// Allows a tiny bit more overlap before separation
+const CAR_COLLISION_SLOP = 1.5; // try 1.0–1.5; higher = more visual overlap
+
+// --- AI tunables ---
+const AI_TOP_SPEED   = CAR_MAX_SPEED * 1.12; // AI can be ~12% faster than the player
+const AI_REACTION_MS = 120;             // larger = slower reactions
+const AI_STEER_GAIN  = 1.00;            // 0.6–1.4 typical
+const AI_PREDICT_T   = 0.60;            // seconds of lead when ball is on player's half
+
+// --- Corner-stuck detection and escape (AI only) ---
+const AI_CORNER_STUCK_SPEED        = 80;    // px/s
+const AI_CORNER_STUCK_DIST         = 90;    // px
+const AI_CORNER_STUCK_LINGER_MS    = 350;   // ms before escape triggers
+
+// Quicker escape: about 1/3 the duration
+const AI_CORNER_ESCAPE_MS          = 2200;  // was ~3850ms; shorter = "quicker"
+const AI_CORNER_ESCAPE_COOLDOWN_MS = 2600;  // escape + small buffer
+
+// New: slight random steering while reversing
+const AI_ESCAPE_STEER_BIAS         = 0.9;  // small constant bias left/right
+const AI_ESCAPE_KICK_MS            = 300;   // first ~1/4s: max reverse throttle for punch
+
+
+// Defensive clamp (prevents own-goals)
+const AI_OWNGOAL_ZONE_X_FRAC = 0.54;
+
+// --- AI feature flags ---
+const AI_FEATURE_ASSIST       = false; // disable cheat assist for now
+const AI_FEATURE_KICKOFF_PLAY = true;  // simple kickoff lane
+
+/* === AI pivot package (post-first-hit only) === */
+const AI_PIVOT_ON            = true;   // master switch
+const AI_PIVOT_DIST          = 360;    // px from ball to allow pivot aids
+const AI_PIVOT_ERR_RAD       = 0.70;   // heading error threshold to engage (radians)
+const AI_PIVOT_YAW_GAIN      = 0.65;   // extra yaw toward target (fraction of desired AV)
+const AI_PIVOT_GLUE          = 9.0;    // extra lateral "steer assist" (per second) while pivoting
+const AI_PIVOT_BRAKE_DECEL   = 520;    // extra rolling decel (px/s^2) when very close & misaligned
+const AI_PIVOT_BRAKE_DIST    = 260;    // px from ball where the brake can apply
+const AI_PIVOT_MAX_AV_SCALE  = 1.80;   // raises AI AV clamp while pivoting (visual plausibility bound)
+
+/* === NEW: smarter AI toggles === */
+const AI_FEATURE_SMART_SHOTS  = true;  // far-post & bank planner
+const AI_FEATURE_FINISH_MODE  = true;  // finishing override in attack zone
+const AI_FEATURE_SMART_NUDGE  = true;  // situational, post-contact velocity nudge
+
+// --- NEW: spawn position tunables ---
+const CAR_SPAWN_X_FRAC = 0.1; // 0.25 = near left goal, 0.5 = center, 0.75 = near right goal
+const CAR_SPAWN_Y_FRAC = 0.50; // vertical center
+
+// Bounce tuning for car–car impacts
+const CAR_RESTITUTION = 0.85;   // higher = bouncier (0.7–0.9 good)
+const MIN_BOUNCE_N    = 140;    // minimum normal rebound speed for the victim (px/s)
+
+// Slightly shrink the car's collision circle vs. its visual body (px)
+const CAR_HITBOX_SHRINK = 5; // was 3; try 4–6
+
+// Allow a few pixels of car–car overlap before separation starts
+const CAR_CAR_EXTRA_OVERLAP = 4; // try 3–6 px
+
+// ========================= [ENTITY: AI CAR] =========================
+const aiCar = {
+  // Spawn will be set in resetWorld() after arena/inner/goals are defined
+  pos: { x: 0, y: 0 },
+  vel: { x: 0, y: 0 },
+  angle: Math.PI,   // face left initially
+  angularVel: 0
+};
+
+// Simple persistent AI controller state (for reaction smoothing)
+const aiCtl = { steer: 0, throttle: 0, lastMs: performance.now() };
+let aiCornerStuckStartMs = 0;
+let aiCornerEscapeUntil  = 0;
+let aiCornerLastEscapeAt = 0;
+let aiCornerEscapeStartMs = 0; // when current escape began
+let aiCornerEscapeBias    = 0; // fixed steer bias during this escape (-bias = left, +bias = right)
+
+
+  // ========================= [INPUT] =========================
+  const keys = new Set();
+
+  // ========================= [WORLD: ARENA/INNER/GOALS] =========================
+  const arena = {
+    x: Math.round((INTERNAL_W - ARENA_W) / 2),
+    y: Math.round((INTERNAL_H - ARENA_H) / 2),
+    w: ARENA_W, h: ARENA_H
+  };
+  const inner = {
+    left: arena.x + WALL_THICKNESS,
+    right: arena.x + ARENA_W - WALL_THICKNESS,
+    top: arena.y + WALL_THICKNESS,
+    bottom: arena.y + ARENA_H - WALL_THICKNESS,
+  };
+  const goals = {
+    left:  { x: arena.x - GOAL_W, y: arena.y + Math.round((ARENA_H - GOAL_H)/2), w: GOAL_W, h: GOAL_H, color: GOAL_LEFT_COLOR },
+    right: { x: arena.x + ARENA_W, y: arena.y + Math.round((ARENA_H - GOAL_H)/2), w: GOAL_W, h: GOAL_H, color: GOAL_RIGHT_COLOR }
+  };
+
+  // ========================= [ENTITY: BALL] =========================
+  const probe = {
+    x: arena.x + ARENA_W / 2,
+    y: arena.y + ARENA_H / 2,
+    r: 12,
+    vx: 0, vy: 0,
+    accel: 1800, maxSpeed: 900 // accel unused by input now; kept for completeness
+  };
+
+// ========================= [SCORE / GOAL LOGIC] =========================
+let scoreLeft = 0, scoreRight = 0;
+
+function onGoal(side) {
+  // increment score instantly
+  if (side === 'left') scoreLeft++;
+  else if (side === 'right') scoreRight++;
+
+  // --- NEW: sudden death check ---
+  if (suddenDeath) {
+    state = GameState.Ended;
+    endBanner = (side === PLAYER_SIDE) ? 'You win!' : 'You lose.';
+    return; // stop here, no reset
+  }
+
+  // Reset ball to center and freeze
+  probe.x = arena.x + ARENA_W / 2;
+  probe.y = arena.y + ARENA_H / 2;
+  probe.vx = 0;
+  probe.vy = 0;
+
+  // Reset player car to spawn position and freeze
+  car.pos.x = arena.x + ARENA_W * CAR_SPAWN_X_FRAC;
+  car.pos.y = arena.y + ARENA_H * CAR_SPAWN_Y_FRAC;
+  car.angle = 0;
+  car.vel.x = 0;
+  car.vel.y = 0;
+  car.angularVel = 0;
+
+  // Reset AI car to mirrored spawn and freeze
+  aiCar.pos.x = arena.x + ARENA_W * (1 - CAR_SPAWN_X_FRAC);
+  aiCar.pos.y = arena.y + ARENA_H * CAR_SPAWN_Y_FRAC;
+  aiCar.angle = Math.PI;
+  aiCar.vel.x = 0;
+  aiCar.vel.y = 0;
+  aiCar.angularVel = 0;
+
+  // Enter Resetting substate for countdown
+  playSubstate = PlayingSubstate.Resetting;
+  resetStartMs = performance.now();
+  resetEndsAt  = resetStartMs + RESET_PAUSE_MS;
+}
+
+
+// ========================= [ENTITY: CAR] =========================
+const car = {
+  pos: { 
+    x: arena.x + ARENA_W * CAR_SPAWN_X_FRAC, 
+    y: arena.y + ARENA_H * CAR_SPAWN_Y_FRAC 
+  },
+  vel: { x: 0, y: 0 },
+  angle: 0,
+  angularVel: 0
+};
+
+  // ========================= [CANVAS: DPR SETUP] =========================
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d', { alpha: false });
+  ctx.imageSmoothingEnabled = false;
+  function fitCanvas() {
+    const dpr = devicePixelRatio || 1;
+    const scale = Math.min(innerWidth / INTERNAL_W, innerHeight / INTERNAL_H);
+    canvas.style.width = (INTERNAL_W * scale) + 'px';
+    canvas.style.height = (INTERNAL_H * scale) + 'px';
+    const bsW = Math.floor(INTERNAL_W * dpr), bsH = Math.floor(INTERNAL_H * dpr);
+    if (canvas.width !== bsW) canvas.width = bsW;
+    if (canvas.height !== bsH) canvas.height = bsH;
+    ctx.setTransform(1,0,0,1,0,0); ctx.setTransform(dpr,0,0,dpr,0,0);
+  }
+  addEventListener('resize', fitCanvas); fitCanvas();
+
+  // ========================= [STATE: FLOW (START/RESET)] =========================
+addEventListener('keydown', (e) => {
+  if (e.repeat) return;
+  const k = e.key.toLowerCase();
+  keys.add(k);
+  if (k === 'enter' && state === GameState.Menu) startGame();
+  if (k === 'r'     && state === GameState.Ended) restartFromEnded();
+  if (k === 'enter' && state === GameState.Ended) restartFromEnded();  // <-- NEW
+});
+addEventListener('keyup', (e) => keys.delete(e.key.toLowerCase()));
+
+function startGame() {
+  resetWorld();
+  state = GameState.Playing;
+
+  // (NEW) reset match timer & golden goal state
+  timeLeft = MATCH_SECONDS;
+  suddenDeath = false;
+  TIMER_PAUSED = false;
+  endBanner = '';
+
+  // Begin with a countdown
+  playSubstate = PlayingSubstate.Resetting;
+  resetStartMs = performance.now();
+  resetEndsAt  = resetStartMs + RESET_PAUSE_MS;
+
+  // Freeze motion during countdown
+  probe.vx = 0; probe.vy = 0;
+  car.vel.x = 0; car.vel.y = 0; car.angularVel = 0;
+}
+
+function restartFromEnded() {
+  // Hard reset to Menu (initial load state)
+  state = GameState.Menu;
+
+  // Reset scores (fix: ensure scoreboard clears between matches)
+  scoreLeft = 0;
+  scoreRight = 0;
+
+  // Clear timers/flags/overlays
+  timeLeft = MATCH_SECONDS;
+  suddenDeath = false;
+  TIMER_PAUSED = false;
+  endBanner = '';
+  playSubstate = PlayingSubstate.Active;
+  resetStartMs = 0;
+  resetEndsAt  = 0;
+  suddenDeathStartedAt = 0;
+
+  // Reset world to pristine positions
+  resetWorld();
+}
+
+function resetWorld() {
+  // Ball to center, then eject straight up or down with randomized vertical speed
+  probe.x = arena.x + ARENA_W / 2;
+  probe.y = arena.y + ARENA_H / 2;
+
+  // No horizontal velocity at spawn
+  probe.vx = 0;
+
+  // Randomize vertical speed within range, pick up or down
+  const s = MIN_Y_SPEED + Math.random() * (MAX_Y_SPEED - MIN_Y_SPEED);
+  const dir = Math.random() < 0.5 ? -1 : 1; // -1 = upward, 1 = downward (screen coords)
+  probe.vy = dir * s;
+
+  // Player car to spawn position
+  car.pos.x = arena.x + ARENA_W * CAR_SPAWN_X_FRAC;
+  car.pos.y = arena.y + ARENA_H * CAR_SPAWN_Y_FRAC;
+  car.vel.x = 0;
+  car.vel.y = 0;
+  car.angle = 0;
+  car.angularVel = 0;
+
+  // AI car: mirror spawn on the right side
+  aiCar.pos.x = arena.x + ARENA_W * (1 - CAR_SPAWN_X_FRAC);
+  aiCar.pos.y = arena.y + ARENA_H * CAR_SPAWN_Y_FRAC;
+  aiCar.vel.x = 0;
+  aiCar.vel.y = 0;
+  aiCar.angle = Math.PI;   // face left
+  aiCar.angularVel = 0;
+}
+
+
+  // ========================= [LOOP: RAF & ACCUMULATOR] =========================
+  let last = performance.now(), acc = 0, fps=60, fa=0, fc=0, ft=0;
+  function raf(now) {
+    let dt = (now - last)/1000; last = now; if (dt > 0.25) dt = 0.25;
+    acc += dt; while (acc >= DT) { updateFixed(DT); acc -= DT; }
+    render();
+    fa += 1/(dt||1/60); fc++; ft += dt; if (ft >= 0.25) { fps = Math.round(fa/fc); fa=fc=ft=0; }
+    requestAnimationFrame(raf);
+  }
+  requestAnimationFrame(raf);
+
+// --- AI ahead-of-ball predictor (lightweight, stable) ---
+// Tunables (sensible defaults)
+window.AI_AHEAD_T_MIN       = 0.18;
+window.AI_AHEAD_T_MAX       = 1.10;
+window.AI_AHEAD_DIST_GAIN   = 0.0040; // lead grows faster with distance
+window.AI_AHEAD_SLOW_SCALE  = 0.65;   // keep some lead even when ball is slow
+
+function AI_aheadPoint(carX, carY, ballX, ballY, ballVX, ballVY) {
+  const d  = Math.hypot(ballX - carX, ballY - carY);
+  const sb = Math.hypot(ballVX, ballVY);
+  // Base lead grows with distance; capped
+  let t = clamp(window.AI_AHEAD_T_MIN + window.AI_AHEAD_DIST_GAIN * d,
+                window.AI_AHEAD_T_MIN, window.AI_AHEAD_T_MAX);
+  // If ball is slow, don't over-lead; scale toward smaller t
+  const speedFrac = clamp(sb / (CAR_MAX_SPEED || 1), 0, 1);
+  const slowK = window.AI_AHEAD_SLOW_SCALE; // 0..1
+  t = t * (slowK + (1 - slowK) * speedFrac);
+
+  return { x: ballX + ballVX * t, y: ballY + ballVY * t, t };
+}
+
+// ========================= [HELPER: BALL VS WALLS] =========================
+function updateBallVsWalls() {
+  const leftBound   = inner.left   + probe.r;
+  const rightBound  = inner.right  - probe.r;
+  const topBound    = inner.top    + probe.r;
+  const bottomBound = inner.bottom - probe.r;
+
+  // Opening span: strict + grace
+  const gTop = goals.left.y, gBot = goals.left.y + goals.left.h;
+
+  // Small plane epsilon and corner grace (you can tune these in constants)
+  const EPS = (typeof GOAL_EPS !== 'undefined') ? GOAL_EPS : 0.01;
+
+  const inGoalVerticalStrict =
+    (probe.y >= gTop + probe.r + EPS) && (probe.y <= gBot - probe.r - EPS);
+
+  const inGoalVerticalGrace =
+    (probe.y >= gTop - GOAL_CORNER_GRACE + probe.r) &&
+    (probe.y <= gBot + GOAL_CORNER_GRACE - probe.r);
+
+  // --- (A) SCORE FIRST using LEADING-EDGE crossing (prevents corner pop-out) ---
+  // Left goal plane is x = arena.x; score when the ball's LEFT edge reaches that plane.
+  if (inGoalVerticalGrace && (probe.x - probe.r <= arena.x + EPS)) {
+    onGoal('right'); return;
+  }
+  // Right goal plane is x = arena.x + ARENA_W; score when the ball's RIGHT edge reaches that plane.
+  if (inGoalVerticalGrace && (probe.x + probe.r >= arena.x + ARENA_W - EPS)) {
+    onGoal('left'); return;
+  }
+
+  // --- (B) X walls: bounce only if NOT within the strict mouth span ---
+  if (probe.x < leftBound && !inGoalVerticalStrict) {
+    probe.x = leftBound;
+    probe.vx = -probe.vx * ELASTICITY;
+  } else if (probe.x > rightBound && !inGoalVerticalStrict) {
+    probe.x = rightBound;
+    probe.vx = -probe.vx * ELASTICITY;
+  }
+
+
+
+ // Only suppress vertical bounce when the ball's leading edge is actually inside the mouth,
+// not when it's merely touching the field-side of the side wall.
+const insideLeftMouth  = (probe.x - probe.r) < inner.left  + EPS;
+const insideRightMouth = (probe.x + probe.r) > inner.right - EPS;
+const suppressY = (insideLeftMouth || insideRightMouth) && inGoalVerticalGrace;
+
+
+  if (!suppressY) {
+    if (probe.y < topBound) {
+      probe.y = topBound;
+      probe.vy = -probe.vy * ELASTICITY;
+    } else if (probe.y > bottomBound) {
+      probe.y = bottomBound;
+      probe.vy = -probe.vy * ELASTICITY;
+    }
+  }
+
+  // --- (D) Final safeguard: if, after resolution, the leading edge has crossed, score. ---
+  if (inGoalVerticalGrace && (probe.x - probe.r <= arena.x + EPS)) { onGoal('right'); return; }
+  if (inGoalVerticalGrace && (probe.x + probe.r >= arena.x + ARENA_W - EPS)) { onGoal('left'); return; }
+}
+
+// Reusable: is a circle center (x,y) near any of the inner or mouth corners?
+function pointNearAnyCorner(x, y, r, dist) {
+  const corners = [
+    // Inner field corners (play area)
+    { x: inner.left  + r, y: inner.top    + r },
+    { x: inner.right - r, y: inner.top    + r },
+    { x: inner.left  + r, y: inner.bottom - r },
+    { x: inner.right - r, y: inner.bottom - r },
+    // Goal mouth corners (field side)
+    { x: inner.left  + r, y: goals.left.y               + r },
+    { x: inner.left  + r, y: goals.left.y + goals.left.h - r },
+    { x: inner.right - r, y: goals.right.y              + r },
+    { x: inner.right - r, y: goals.right.y+goals.right.h - r },
+  ];
+  const d2 = dist * dist;
+  for (let i = 0; i < corners.length; i++) {
+    const dx = x - corners[i].x, dy = y - corners[i].y;
+    if (dx*dx + dy*dy <= d2) return true;
+  }
+  return false;
+}
+
+function kickBallOutOfCorners(nowMs) {
+  // Require the ball to be slow
+  const speed = Math.hypot(probe.vx, probe.vy);
+  if (speed > CORNER_STUCK_SPEED) { ballCornerStartMs = 0; return; }
+
+  // Respect cooldown
+  if (nowMs - lastCornerKickAt < CORNER_KICK_COOLDOWN_MS) return;
+
+  // Must be inside a small corner zone
+  const inZone = pointNearAnyCorner(probe.x, probe.y, probe.r, CORNER_STUCK_DIST);
+  if (!inZone) { ballCornerStartMs = 0; return; }
+
+  // Start or check linger
+  if (!ballCornerStartMs) { ballCornerStartMs = nowMs; return; }
+  if ((nowMs - ballCornerStartMs) < CORNER_STUCK_LINGER_MS) return;
+
+  // One-shot: kick toward the playable area's center (inner rectangle center)
+  const cx = (inner.left + inner.right) * 0.5;
+  const cy = (inner.top  + inner.bottom) * 0.5;
+  let dx = cx - probe.x, dy = cy - probe.y;
+  const len = Math.hypot(dx, dy) || 1;
+  dx /= len; dy /= len;
+
+  const kick = CORNER_KICK_SPEED + Math.random() * CORNER_KICK_SPEED_RAND;
+  probe.vx = dx * kick;
+  probe.vy = dy * kick;
+
+  // Tiny nudge to avoid immediate re-collision
+  probe.x += dx * 2;
+  probe.y += dy * 2;
+
+  lastCornerKickAt = nowMs;
+  ballCornerStartMs = 0;
+}
+
+
+// ========================= [HELPER: CAR–BALL] =========================
+function resolveCarBall() {
+  const dx = probe.x - car.pos.x, dy = probe.y - car.pos.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist <= 0) return;
+
+  // Contact normal from car → ball
+  const nx = dx / dist, ny = dy / dist;
+
+  // Use the car's rotated-rectangle support radius along the contact normal
+  const rCar = carSupportRadiusAlong(nx, ny, car.angle);
+  const minDist = probe.r + rCar;
+  if (dist >= minDist) return;
+
+  // --- Positional correction (mass-proportional), with tunable slop ---
+  const penetration = minDist - dist;
+  const SLOP = (typeof CAR_COLLISION_SLOP !== 'undefined') ? CAR_COLLISION_SLOP : 0.5, PERCENT = 0.8;
+  const invCar  = 1 / CAR_MASS;
+  const invBall = 1 / BALL_MASS;
+  const invSum  = invCar + invBall;
+
+  if (penetration > SLOP) {
+    const corr = ((penetration - SLOP) * PERCENT) / invSum;
+    car.pos.x -= nx * corr * invCar;
+    car.pos.y -= ny * corr * invCar;
+    probe.x   += nx * corr * invBall;
+    probe.y   += ny * corr * invBall;
+  }
+
+  // Relative velocity
+  const rvx = probe.vx - car.vel.x;
+  const rvy = probe.vy - car.vel.y;
+
+  // --- Normal impulse (bounce) ---
+  const velAlongN = rvx * nx + rvy * ny;
+  if (velAlongN > 0) return; // separating, no impulse
+
+  const e = BALL_BOUNCE_CAR;
+  let jn = -(1 + e) * velAlongN / invSum;
+
+  // Heading-aligned boost (existing behavior)
+  const carSp = Math.hypot(car.vel.x, car.vel.y);
+  if (carSp > 1e-3) {
+    const vxh = car.vel.x / carSp, vyh = car.vel.y / carSp;   // car heading
+    const align = Math.max(0, vxh * nx + vyh * ny);           // only when pushing into normal
+    const speedFactor = Math.min(1, carSp / CAR_MAX_SPEED);   // scale by actual speed
+    const boost = 1 + CAR_HEADING_BOOST * align * speedFactor;
+    jn *= boost;
+  }
+
+  // Clamp normal impulse to avoid explosions on deep overlap
+  const JN_MAX = 5000;
+  if (jn > JN_MAX) jn = JN_MAX;
+
+  const impN_x = jn * nx, impN_y = jn * ny;
+
+  // Apply normal impulse
+  probe.vx += impN_x * invBall;
+  probe.vy += impN_y * invBall;
+  car.vel.x -= impN_x * invCar;
+  car.vel.y -= impN_y * invCar;
+
+  // --- Tangential impulse (carry ball along car's travel direction) ---
+  const tx = -ny, ty = nx;
+  const velAlongT = rvx * tx + rvy * ty;
+
+  let jt = -BALL_TANGENTIAL_COUPLING * velAlongT / invSum;
+
+  const JT_MAX = 3000;
+  if (jt >  JT_MAX) jt =  JT_MAX;
+  if (jt < -JT_MAX) jt = -JT_MAX;
+
+  const impT_x = jt * tx, impT_y = jt * ty;
+
+  // Apply tangential impulse
+  probe.vx += impT_x * invBall;
+  probe.vy += impT_y * invBall;
+  car.vel.x -= impT_x * invCar;
+  car.vel.y -= impT_y * invCar;
+
+  // Post-collision caps
+  const carSp2 = Math.hypot(car.vel.x, car.vel.y);
+  if (carSp2 > CAR_MAX_SPEED) {
+    const s = CAR_MAX_SPEED / carSp2; car.vel.x *= s; car.vel.y *= s;
+  }
+  const ballMax = probe.maxSpeed * 1.5;
+  const ballSp2 = Math.hypot(probe.vx, probe.vy);
+  if (ballSp2 > ballMax) {
+    const s = ballMax / ballSp2; probe.vx *= s; probe.vy *= s;
+  }
+}
+
+// ========================= [HELPER: MATH & COLLISION] =========================
+// --- Global numeric clamp helper (used by AI and physics) ---
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function lerp(a, b, t)  { return a + (b - a) * clamp(t, 0, 1); }
+
+function carHalfExtents(shrinkPx) {
+  const shrink = (typeof shrinkPx === 'number') ? shrinkPx : (typeof CAR_HITBOX_SHRINK !== 'undefined' ? CAR_HITBOX_SHRINK : 0);
+  // Drawn car body is ~1.6R × 1.2R → half extents 0.8R, 0.6R
+  const hw = Math.max(2, 0.8 * CAR_RADIUS - shrink);
+  const hh = Math.max(2, 0.6 * CAR_RADIUS - shrink);
+  return { hw, hh };
+}
+
+// Support radius of the car's rotated rectangle along direction n = (nx, ny)
+function carSupportRadiusAlong(nx, ny, angle, shrinkPx) {
+  const { hw, hh } = carHalfExtents(shrinkPx);
+  const c = Math.cos(angle), s = Math.sin(angle);
+  // Car local axes in world space
+  const ux =  c, uy =  s;  // local +X
+  const vx = -s, vy =  c;  // local +Y
+  // Projection of OBB along n
+  return Math.abs(nx * ux + ny * uy) * hw + Math.abs(nx * vx + ny * vy) * hh;
+}
+
+// Car vs walls using the car's rotated rectangle (OBB) projected to an AABB.
+// Returns clamped position & reflected velocity (same params as circle version).
+function collideCarOBBInnerRect(px, py, angle, vx, vy, bounce=CAR_BOUNCE, tangentKeep=CAR_TANGENT_KEEP) {
+  // Car body is ~1.6R × 1.2R → half extents 0.8R, 0.6R (honor CAR_HITBOX_SHRINK if set)
+  const shrink = (typeof CAR_HITBOX_SHRINK !== 'undefined') ? CAR_HITBOX_SHRINK : 0;
+  const hw = Math.max(2, 0.8 * CAR_RADIUS - shrink);
+  const hh = Math.max(2, 0.6 * CAR_RADIUS - shrink);
+
+  // AABB half-extents of rotated rect
+  const c = Math.cos(angle), s = Math.sin(angle);
+  const extX = Math.abs(c) * hw + Math.abs(s) * hh;
+  const extY = Math.abs(s) * hw + Math.abs(c) * hh;
+
+  let hit = false, nx = 0, ny = 0;
+
+  // Clamp against inner play area using those extents
+  const minX = inner.left   + extX, maxX = inner.right  - extX;
+  const minY = inner.top    + extY, maxY = inner.bottom - extY;
+
+  if (px < minX) { px = minX; nx =  1; hit = true; }
+  else if (px > maxX) { px = maxX; nx = -1; hit = true; }
+
+  if (py < minY) { py = minY; ny =  1; hit = true; }
+  else if (py > maxY) { py = maxY; ny = -1; hit = true; }
+
+  if (hit) {
+    // Reflect normal component, keep some tangent
+    const vDotN = vx*nx + vy*ny;
+    const vN_x = vDotN*nx, vN_y = vDotN*ny;
+    const vT_x = vx - vN_x,  vT_y = vy - vN_y;
+    vx = -vN_x * bounce + vT_x * tangentKeep;
+    vy = -vN_y * bounce + vT_y * tangentKeep;
+
+    // Small positional nudge to avoid sticky edges
+    if (typeof CAR_IMPULSE_PUSH !== 'undefined' && typeof DT !== 'undefined') {
+      px += nx * CAR_IMPULSE_PUSH * DT;
+      py += ny * CAR_IMPULSE_PUSH * DT;
+    }
+
+    // Speed cap (same as elsewhere)
+    const sp = Math.hypot(vx, vy);
+    if (sp > CAR_MAX_SPEED) { const s = CAR_MAX_SPEED / sp; vx *= s; vy *= s; }
+  }
+  // Small positional nudge to avoid sticky edges
+if (typeof CAR_IMPULSE_PUSH !== 'undefined' && typeof DT !== 'undefined') {
+  px += nx * CAR_IMPULSE_PUSH * DT;
+  py += ny * CAR_IMPULSE_PUSH * DT;
+}
+
+// Extra outward kick if we hit a geometric corner (both axes clamped)
+if (nx !== 0 && ny !== 0) {
+  const OUT_KICK = 26; // small: just enough to break jackknife
+  vx += nx * OUT_KICK;
+  vy += ny * OUT_KICK;
+}
+
+
+  return { px, py, vx, vy };
+}
+
+// ========================= [HELPER: CAR–BALL: AI VERSION] =========================
+// AI version: identical physics, plus an anti-own-goal impulse clamp in the AI’s defensive zone.
+function resolveCarBallWith(carEntity) {
+  const dx = probe.x - carEntity.pos.x, dy = probe.y - carEntity.pos.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist <= 0) return;
+
+  // Contact normal from car → ball (geometric)
+  const nxG = dx / dist, nyG = dy / dist;
+
+  // Use the car's rotated-rectangle support radius along the geometric normal
+  const rCar = (typeof carSupportRadiusAlong === 'function')
+    ? carSupportRadiusAlong(nxG, nyG, carEntity.angle)
+    : Math.max(2, CAR_RADIUS - (typeof CAR_HITBOX_SHRINK !== 'undefined' ? CAR_HITBOX_SHRINK : 0));
+  const minDist = probe.r + rCar;
+  if (dist >= minDist) return;
+
+  // --- Positional correction (mass-proportional), with tunable slop ---
+  const penetration = minDist - dist;
+  const SLOP = (typeof CAR_COLLISION_SLOP !== 'undefined') ? CAR_COLLISION_SLOP : 0.5, PERCENT = 0.8;
+  const invCar  = 1 / CAR_MASS;
+  const invBall = 1 / BALL_MASS;
+  const invSum  = invCar + invBall;
+
+  if (penetration > SLOP) {
+    const corr = ((penetration - SLOP) * PERCENT) / invSum;
+    carEntity.pos.x -= corr * invCar * nxG;
+    carEntity.pos.y -= corr * invCar * nyG;
+    probe.x         += corr * invBall * nxG;
+    probe.y         += corr * invBall * nyG;
+  }
+
+  // Relative velocity at contact along geometric normal
+  const rvx = probe.vx - carEntity.vel.x;
+  const rvy = probe.vy - carEntity.vel.y;
+
+  // Impulse normal (may be clamped later for anti-own-goal defense)
+  let nxI = nxG, nyI = nyG;
+
+// --- Defensive clamp to reduce own-goals when AI in right half and ball going right ---
+{
+  const OWN_FRAC = (typeof AI_OWNGOAL_ZONE_X_FRAC !== 'undefined') ? AI_OWNGOAL_ZONE_X_FRAC : 0;
+  if (OWN_FRAC > 0) {
+    const ownZoneX   = arena.x + ARENA_W * OWN_FRAC;
+    const towardRight= rvx > 0;
+    if (probe.x > ownZoneX && towardRight) {
+      // Pull impulse normal away from rightward shots
+      const blend = 0.45;
+      let bx = nxI*(1 - blend) - blend; // bias X toward -1 (left)
+      let by = nyI*(1 - blend);
+      const bl = Math.hypot(bx, by) || 1;
+      nxI = bx / bl; nyI = by / bl;
+    }
+  }
+}
+
+  // --- Normal impulse (bounce) using (possibly clamped) impulse normal ---
+  const velAlongI = rvx * nxI + rvy * nyI;
+  if (velAlongI > 0) return; // separating
+
+  const e = BALL_BOUNCE_CAR;
+  let jn = -(1 + e) * velAlongI / invSum;
+
+  // Heading-aligned boost
+  const sp = Math.hypot(carEntity.vel.x, carEntity.vel.y);
+  if (sp > 1) {
+    const hx = carEntity.vel.x / sp, hy = carEntity.vel.y / sp;
+    const align = Math.max(0, hx * nxI + hy * nyI);
+    const speedFactor = Math.min(1, sp / CAR_MAX_SPEED);
+    jn *= (1 + CAR_HEADING_BOOST * align * speedFactor);
+  }
+
+  // Clamp normal impulse
+  const JN_MAX = 5000;
+  if (jn > JN_MAX) jn = JN_MAX;
+
+  const impN_x = jn * nxI, impN_y = jn * nyI;
+
+  // Apply normal impulse
+  probe.vx += impN_x * invBall;
+  probe.vy += impN_y * invBall;
+  carEntity.vel.x -= impN_x * invCar;
+  carEntity.vel.y -= impN_y * invCar;
+
+  // --- Tangential impulse (same as player) ---
+  const tx = -nyI, ty = nxI;
+  const velAlongT = rvx * tx + rvy * ty;
+  let jt = -BALL_TANGENTIAL_COUPLING * velAlongT / invSum;
+
+  const JT_MAX = 3000;
+  if (jt >  JT_MAX) jt =  JT_MAX;
+  if (jt < -JT_MAX) jt = -JT_MAX;
+
+  const impT_x = jt * tx, impT_y = jt * ty;
+
+  probe.vx += impT_x * invBall;
+  probe.vy += impT_y * invBall;
+  carEntity.vel.x -= impT_x * invCar;
+  carEntity.vel.y -= impT_y * invCar;
+
+// --- Controlled assist toward LEFT goal (AI only, "Hard" settings) ---
+// REMOVED: AI is disabled. Do not alter ball after AI contact.
+if (false && carEntity === aiCar) {
+  // no-op
+}
+
+  // Post-collision caps
+  const carSp2 = Math.hypot(carEntity.vel.x, carEntity.vel.y);
+  if (carSp2 > CAR_MAX_SPEED) { const s = CAR_MAX_SPEED / carSp2; carEntity.vel.x *= s; carEntity.vel.y *= s; }
+  const ballMax = probe.maxSpeed * 1.5;
+  const ballSp2 = Math.hypot(probe.vx, probe.vy);
+  if (ballSp2 > ballMax) { const s = ballMax / ballSp2; probe.vx *= s; probe.vy *= s; }
+}
+
+// ========================= [HELPER: CAR–CAR] =========================
+function resolveCarCar() {
+  // Circle vs circle between player car (A = `car`) and AI car (B = `aiCar`)
+    const dx = aiCar.pos.x - car.pos.x;
+  const dy = aiCar.pos.y - car.pos.y;
+
+  // Distance between centers
+  const dist = Math.hypot(dx, dy);
+
+  // Effective collision radius (honors any CAR_HITBOX_SHRINK you set)
+  const effCarR = Math.max(2, CAR_RADIUS - (typeof CAR_HITBOX_SHRINK !== 'undefined' ? CAR_HITBOX_SHRINK : 0));
+  const minDist = effCarR * 2;
+
+  // Early-out threshold: let them interpenetrate a few pixels before resolving
+  const triggerDist = Math.max(4, minDist - (typeof CAR_CAR_EXTRA_OVERLAP !== 'undefined' ? CAR_CAR_EXTRA_OVERLAP : 0));
+
+  if (dist <= 0 || dist >= triggerDist) return;
+
+
+  // 1) Collision normal n from A → B
+  const nx = dx / dist, ny = dy / dist;
+
+  // Equal masses by default (uses CAR_MASS)
+  const invA = 1 / CAR_MASS;
+  const invB = 1 / CAR_MASS;
+  const invSum = invA + invB;
+
+  // --- Positional correction (prevents overlap jitter) ---
+  const rawPen = minDist - dist; // full interpenetration
+  const penetration = rawPen - (typeof CAR_CAR_EXTRA_OVERLAP !== 'undefined' ? CAR_CAR_EXTRA_OVERLAP : 0);
+  const SLOP = 0.5, PERCENT = 0.8;
+  if (penetration > SLOP) {
+    const corr = ((penetration - SLOP) * PERCENT) / invSum;
+    car.pos.x   -= nx * corr * invA;  car.pos.y   -= ny * corr * invA;
+    aiCar.pos.x += nx * corr * invB;  aiCar.pos.y += ny * corr * invB;
+  }
+
+  // 2) Relative velocity (rv = vB - vA)
+  const rvx = aiCar.vel.x - car.vel.x;
+  const rvy = aiCar.vel.y - car.vel.y;
+
+  // 3) Approach speed along normal
+  const rvn = rvx * nx + rvy * ny;
+  if (rvn >= 0) return; // not approaching → no normal impulse
+
+  // --- Identify hitter vs victim (who is moving into the other more along n)
+  const vA_n = car.vel.x   * nx + car.vel.y   * ny;   // A toward +n -> toward B
+  const vB_n = aiCar.vel.x * nx + aiCar.vel.y * ny;   // B toward -n -> toward A
+  const aTowardB = Math.max(0,  vA_n);
+  const bTowardA = Math.max(0, -vB_n);
+  const hitterIsA = (aTowardB >= bTowardA); // tie → A as hitter
+
+  // 4) Base normal impulse (restitution e)
+  const e = (typeof CAR_RESTITUTION !== 'undefined') ? CAR_RESTITUTION : 0.5;
+  let j = -(1 + e) * rvn / invSum;
+  if (typeof CAR_CAR_KNOCKBACK !== 'undefined') j *= CAR_CAR_KNOCKBACK; // optional global gain
+
+  // Role bias: less rebound for hitter, more for victim
+  const hitF = (typeof CAR_HIT_HITTER_FACTOR !== 'undefined') ? CAR_HIT_HITTER_FACTOR : 0.5;
+  const vicG = (typeof CAR_HIT_VICTIM_GAIN   !== 'undefined') ? CAR_HIT_VICTIM_GAIN   : 1.4;
+  let jH = j * hitF;
+  let jV = j * vicG;
+
+  // Clamp to avoid explosions
+  const JN_MAX = 4000 * Math.max(1, (typeof CAR_CAR_KNOCKBACK !== 'undefined') ? CAR_CAR_KNOCKBACK : 1, vicG);
+  if (jH > JN_MAX) jH = JN_MAX;
+  if (jV > JN_MAX) jV = JN_MAX;
+
+  // 5) Apply biased normal impulses
+  if (hitterIsA) {
+    // A hits B
+    car.vel.x   -= jH * invA * nx; car.vel.y   -= jH * invA * ny; // reduced rebound for A
+    aiCar.vel.x += jV * invB * nx; aiCar.vel.y += jV * invB * ny; // amplified knockback for B
+  } else {
+    // B hits A
+    car.vel.x   -= jV * invA * nx; car.vel.y   -= jV * invA * ny; // amplified knockback for A
+    aiCar.vel.x += jH * invB * nx; aiCar.vel.y += jH * invB * ny; // reduced rebound for B
+  }
+
+  // --- Ensure a visible bounce for the victim (minimum separation speed along n)
+  // Recompute normal components after impulses
+  const vA_n2 = car.vel.x   * nx + car.vel.y   * ny;
+  const vB_n2 = aiCar.vel.x * nx + aiCar.vel.y * ny;
+
+  if (hitterIsA) {
+    // Victim = B; want B moving along +n at least MIN_BOUNCE_N
+    const need = MIN_BOUNCE_N - vB_n2;
+    if (need > 0) {
+      let jExtra = need / invSum;                 // impulse to add separation speed `need`
+      if (jExtra > JN_MAX) jExtra = JN_MAX;
+      car.vel.x   -= jExtra * invA * nx; car.vel.y   -= jExtra * invA * ny;
+      aiCar.vel.x += jExtra * invB * nx; aiCar.vel.y += jExtra * invB * ny;
+    }
+  } else {
+    // Victim = A; want A moving along -n at least MIN_BOUNCE_N (i.e., vA_n2 <= -MIN_BOUNCE_N)
+    const need = MIN_BOUNCE_N + vA_n2;            // since vA_n2 should be negative
+    if (need > 0) {
+      let jExtra = need / invSum;
+      if (jExtra > JN_MAX) jExtra = JN_MAX;
+      car.vel.x   -= jExtra * invA * nx; car.vel.y   -= jExtra * invA * ny;
+      aiCar.vel.x += jExtra * invB * nx; aiCar.vel.y += jExtra * invB * ny;
+    }
+  }
+
+  // --- Small tangential slip reduction (keeps handling feel)
+  const tx = -ny, ty = nx;
+  const velAlongT = rvx * tx + rvy * ty;
+  const mu = (typeof CAR_TANGENT_KEEP !== 'undefined') ? (1 - CAR_TANGENT_KEEP) : 0.12;
+  let jt = -mu * velAlongT / invSum;
+
+  const JT_MAX = 2500;
+  if (jt >  JT_MAX) jt =  JT_MAX;
+  if (jt < -JT_MAX) jt = -JT_MAX;
+
+  const impT_x = jt * tx, impT_y = jt * ty;
+  car.vel.x   -= impT_x * invA;  car.vel.y   -= impT_y * invA;
+  aiCar.vel.x += impT_x * invB;  aiCar.vel.y += impT_y * invB;
+
+  // Speed caps (consistent with your car limits)
+  let spA = Math.hypot(car.vel.x, car.vel.y);
+  if (spA > CAR_MAX_SPEED) { const s = CAR_MAX_SPEED / spA; car.vel.x *= s; car.vel.y *= s; }
+  let spB = Math.hypot(aiCar.vel.x, aiCar.vel.y);
+  if (spB > CAR_MAX_SPEED) { const s = CAR_MAX_SPEED / spB; aiCar.vel.x *= s; aiCar.vel.y *= s; }
+}
+
+// ========================= [HELPER: AI CONTROL] =========================
+// Kickoff first-shot AI with goal-facing orientation (freeze-safe):
+// - Rearms on each kickoff/reset.
+// - Simulates the car's curved path and prefers the earliest intercept where the car
+//   faces the user's goal at contact; falls back to direct hit if needed.
+// - Hardened timestep handling to avoid zero-dt infinite loops after countdowns.
+
+if (typeof aiCtl === 'undefined') window.aiCtl = { steer: 0, throttle: 0, prevErr: 0 };
+
+if (typeof window.aiFirstShotDone   === 'undefined') window.aiFirstShotDone   = false;
+if (typeof window._aiKickoffArmed   === 'undefined') window._aiKickoffArmed   = false;
+if (typeof window._aiLastState      === 'undefined') window._aiLastState      = undefined;
+if (typeof window._aiLastResetEnds  === 'undefined') window._aiLastResetEnds  = 0;
+if (typeof window._userGoalDir      === 'undefined') window._userGoalDir      = +1; // +1 = right wall, -1 = left wall
+
+// ---- helpers
+function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
+function normalizeAngle(a){ while(a>Math.PI)a-=2*Math.PI; while(a<-Math.PI)a+=2*Math.PI; return a; }
+function supportRadiusAlong(nx, ny, ang){
+  if (typeof carSupportRadiusAlong === 'function') return carSupportRadiusAlong(nx, ny, ang);
+  return (typeof CAR_RADIUS !== 'undefined' ? CAR_RADIUS : 18);
+}
+
+// Determine which wall is the user's goal each kickoff (based on player spawn vs ball)
+// REPLACE THIS FUNCTION
+function _armUsersGoalSide(){
+  // Use the actual player car object (`car`), not `playerCar`.
+  // Fallback to spawn X if anything is undefined.
+  const fallbackX = arena.x + ARENA_W * CAR_SPAWN_X_FRAC;
+  const playerX = (car && car.pos && typeof car.pos.x === 'number') ? car.pos.x : fallbackX;
+
+  // If the player starts to the right of the ball, the user's goal is the right wall; else left.
+  window._userGoalDir = (playerX > probe.x) ? +1 : -1;
+}
+
+
+function goalCenterForUser(){
+  const gx = (window._userGoalDir > 0) ? inner.right : inner.left;
+  const gy = (inner.top + inner.bottom) * 0.5;
+  return { x: gx, y: gy };
+}
+/* === NEW: shot planner helpers (aim for far post; bank off top/bottom when needed) === */
+function userGoalMouth() {
+  const gx = (window._userGoalDir > 0) ? inner.right : inner.left;
+  const yTop = goals.left.y, yBot = goals.left.y + goals.left.h;
+  const MARGIN = Math.max(10, probe.r + 4);
+  return { gx, yTop: yTop + MARGIN, yBot: yBot - MARGIN };
+}
+
+function farPostY(ballY) {
+  const m = userGoalMouth();
+  const toTop = Math.abs(ballY - m.yTop);
+  const toBot = Math.abs(ballY - m.yBot);
+  return (toTop > toBot) ? m.yTop : m.yBot;
+}
+
+function planDirectAim(ballX, ballY) {
+  const m = userGoalMouth();
+  const aim = { x: m.gx, y: farPostY(ballY) };
+  const dir = Math.sign(aim.x - ballX) || 1;
+  const ok = (dir === Math.sign(m.gx - ballX));
+  return ok ? { type: 'direct', aim } : null;
+}
+
+// Compute a bank off top/bottom wall via reflection.
+// For a horizontal wall at y=yWall, reflect the far-post target across that wall
+// and intersect the line from (ballX,ballY) to the reflected point with y=yWall.
+function planBankAim(ballX, ballY) {
+  const m = userGoalMouth();
+  const postY = farPostY(ballY);
+  const opts = [];
+  const topY = inner.top + probe.r;
+  const botY = inner.bottom - probe.r;
+
+  function bankTo(yWall) {
+    const yMirror = 2*yWall - postY;
+    const tx = m.gx, ty = yMirror;
+
+    const dy = ty - ballY;
+    if (Math.abs(dy) < 1e-3) return null;
+    const t = (yWall - ballY) / dy;
+    if (t <= 0 || t >= 1) return null;
+
+    const xHit = ballX + (tx - ballX) * t;
+    const safeL = inner.left + probe.r + 6, safeR = inner.right - probe.r - 6;
+    if (xHit < safeL || xHit > safeR) return null;
+
+    const dir = Math.sign(xHit - ballX) || 1;
+    if (dir !== Math.sign(m.gx - ballX)) return null;
+
+    return { type: 'bank', aim: { x: xHit, y: yWall } };
+  }
+
+  const up = bankTo(topY);   if (up) opts.push(up);
+  const dn = bankTo(botY);   if (dn) opts.push(dn);
+  return opts[0] || null;
+}
+
+function ai_planShot() {
+  if (!AI_FEATURE_SMART_SHOTS) return null;
+  const d = planDirectAim(probe.x, probe.y);
+  const b = planBankAim(probe.x, probe.y);
+  if (d && !b) return d;
+  if (b && !d) return b;
+  if (!d && !b) return null;
+
+  // Prefer the aim that best matches AI's current facing
+  const fx = Math.cos(aiCar.angle), fy = Math.sin(aiCar.angle);
+  function faceCos(aim) {
+    const vx = aim.x - probe.x, vy = aim.y - probe.y;
+    const l = Math.hypot(vx, vy) || 1;
+    return fx*(vx/l) + fy*(vy/l);
+  }
+  return (faceCos(d.aim) >= faceCos(b.aim)) ? d : b;
+}
+
+// Ball Y at time t with top/bottom bounces
+function predictBallYAt(t){
+  const yMin = inner.top + probe.r, yMax = inner.bottom - probe.r;
+  const e = (typeof ELASTICITY !== 'undefined') ? ELASTICITY : 1.0;
+  let y = probe.y, vy = probe.vy, timeLeft = Math.max(0, t);
+  if (!isFinite(timeLeft) || Math.abs(vy) < 1e-6 || timeLeft <= 0) return clamp(y, yMin, yMax);
+  let guard = 0;
+  while (timeLeft > 0 && guard++ < 16) {
+    const toBound = (vy < 0) ? (y - yMin)/(-vy) : (yMax - y)/vy;
+    if (!(toBound > 0) || timeLeft <= toBound) { y += vy*timeLeft; break; }
+    y = (vy < 0) ? yMin : yMax; timeLeft -= toBound; vy = -vy * e;
+  }
+  return clamp(y, yMin, yMax);
+}
+
+// ----- internal simulator (freeze-safe) -----
+// Predicts earliest intercept that also satisfies a facing constraint toward user's goal.
+function simInterceptFacing(maxT, throughDist, minFacingCos){
+  // Copy current AI state
+  let px = aiCar.pos.x, py = aiCar.pos.y;
+  let vx = aiCar.vel.x, vy = aiCar.vel.y;
+  let ang = aiCar.angle, av = aiCar.angularVel;
+
+  // Robust timestep: prefer FIXED_DT, else DT if >0, else 1/120; clamp to sane range
+  const PHYS_DT = (typeof FIXED_DT === 'number' && FIXED_DT > 0) ? FIXED_DT
+                 : (typeof DT === 'number' && DT > 0) ? DT
+                 : 1/120;
+  const dt = clamp(PHYS_DT, 1/240, 1/60); // 0.0042..0.0167s
+
+  const STEER_ASSIST = 4.0;
+  const MIN_TURN_FACTOR_AI = 0.35;
+  const VCAP = Math.min((typeof AI_TOP_SPEED !== 'undefined'?AI_TOP_SPEED:900),
+                        (typeof CAR_MAX_SPEED !== 'undefined'?CAR_MAX_SPEED:900));
+  const ACCEL_FWD   = (typeof CAR_ACCEL !== 'undefined') ? CAR_ACCEL : 1200;
+  const ACCEL_REV   = (typeof CAR_REVERSE_ACCEL !== 'undefined') ? CAR_REVERSE_ACCEL : 800;
+  const TURN_RATE   = (typeof CAR_TURN_RATE !== 'undefined') ? CAR_TURN_RATE : 6.0;
+  const TURN_REFSPD = (typeof CAR_TURN_REFSPD !== 'undefined') ? CAR_TURN_REFSPD : 180;
+  const LIN_F = (typeof CAR_STEP_FRIC_LIN !== 'undefined') ? CAR_STEP_FRIC_LIN : 0.85;
+  const ANG_F = (typeof CAR_STEP_FRIC_ANG !== 'undefined') ? CAR_STEP_FRIC_ANG : 0.45;
+
+  // Step cap: avoid runaway loops if dt is tiny
+  const steps = Math.min(360, Math.max(1, Math.floor(maxT / dt)));
+  let t = 0;
+
+  let facingHit = null, anyHit = null, bestFacingCos = -1.0;
+
+  for (let i=0; i<steps; i++){
+    t += dt;
+
+    // Bail out if anything goes non-finite
+    if (!isFinite(px)||!isFinite(py)||!isFinite(vx)||!isFinite(vy)||!isFinite(ang)||!isFinite(av)) break;
+
+    // Ball now
+    const ballX = probe.x;
+    const ballY = predictBallYAt(t);
+
+    // Goal direction (from ball to user's goal)
+    const g = goalCenterForUser();
+    const gx = g.x - ballX, gy = g.y - ballY;
+    const gLen = Math.hypot(gx, gy) || 1;
+    const ugx = gx / gLen, ugy = gy / gLen;
+
+    // Target through/behind the ball along -goal direction
+    const tx = ballX - ugx * throughDist;
+    const ty = ballY - ugy * throughDist;
+
+    // Steering toward target
+    const targAng = Math.atan2(ty - py, tx - px);
+    const err = normalizeAngle(targAng - ang);
+    const steer = clamp(err / (Math.PI/2), -1, 1);
+
+    // Turn-aware throttle to reduce slide
+    const mis = Math.abs(err);
+    const throttle = (mis > 1.2) ? 0.45 : (mis > 0.9 ? 0.7 : 1.0);
+
+    // Integrate velocity (heading-aligned accel)
+    const ca = Math.cos(ang), sa = Math.sin(ang);
+    const accelMag = throttle >= 0 ? ACCEL_FWD : ACCEL_REV;
+    vx += ca * (accelMag * throttle) * dt;
+    vy += sa * (accelMag * throttle) * dt;
+
+    // Linear damping + rolling decel
+    vx *= LIN_F; vy *= LIN_F;
+    let sp = Math.hypot(vx, vy);
+    if (sp > 1e-3) {
+      const dec = (typeof CAR_ROLLING_DECEL !== 'undefined' ? CAR_ROLLING_DECEL : 220) * dt;
+      const nx = vx / sp, ny = vy / sp;
+      const newSp = Math.max(0, sp - dec);
+      vx = nx*newSp; vy = ny*newSp; sp = newSp;
+    }
+
+    // Steer assist
+    if (Math.abs(steer) > 0 && sp > 1e-3) {
+      const tvx = Math.cos(ang) * sp, tvy = Math.sin(ang) * sp;
+      const k = STEER_ASSIST * dt; vx += (tvx - vx) * k; vy += (tvy - vy) * k;
+    }
+
+    // Turn dynamics
+    const sf = clamp(sp / TURN_REFSPD, 0, 1);
+    const turnRate = TURN_RATE * (MIN_TURN_FACTOR_AI + (1 - MIN_TURN_FACTOR_AI) * sf);
+    const targetAV = steer * turnRate;
+    av += (targetAV - av) * Math.min(1, 18.0 * dt);
+    av *= ANG_F; ang += av * dt;
+
+    // Move
+    px += vx * dt; py += vy * dt;
+
+    // Speed cap
+    const sp2 = Math.hypot(vx, vy);
+    if (sp2 > VCAP) { const s = VCAP / sp2; vx *= s; vy *= s; }
+
+    // Facing alignment toward user's goal
+    const fx = Math.cos(ang), fy = Math.sin(ang);
+    const facingCos = fx*ugx + fy*ugy; // 1 == perfect
+    if (facingCos > bestFacingCos) bestFacingCos = facingCos;
+
+    // Contact test
+    const dx = ballX - px, dy = ballY - py;
+    const dist = Math.hypot(dx, dy);
+    if (dist > 0) {
+      const nx = dx / dist, ny = dy / dist;
+      const rCar = supportRadiusAlong(nx, ny, ang);
+      const inContact = dist <= (probe.r + rCar + 0.5);
+      if (inContact) {
+        if (!anyHit) anyHit = { t, px, py, facingCos };
+        if (facingCos >= minFacingCos && !facingHit) { facingHit = { t, px, py, facingCos }; break; }
+      }
+    }
+  }
+
+  return { facingHit, anyHit, bestFacingCos };
+}
+
+function hasAIBallContact(){
+  const dx = probe.x - aiCar.pos.x, dy = probe.y - aiCar.pos.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist <= 0) return false;
+  const nx = dx / dist, ny = dy / dist;
+  const rCar = supportRadiusAlong(nx, ny, aiCar.angle);
+  return dist <= (probe.r + rCar + 0.5);
+}
+
+// ========================= [AI: KICKOFF FIRST SHOT CONTROL] =========================
+//
+// Keep the existing kickoff first-hit bias EXACTLY AS-IS.
+// After first hit, use a simple, robust controller:
+//  - Predict ball with drag (Y bounces).
+//  - Pick the earliest-reachable sample (distance + small turn cost).
+//  - If on wrong side, orbit behind; else strike through.
+//  - Side-drift aim lead (small).
+//  - Stable steering (PD + slip feed-forward), throttle floors.
+//  - Corner escape when not closing distance near walls.
+//  - No physics changes; only steer/throttle for AI.
+//  - Tiny post-contact nudge (safe, capped) after physics each frame.
+
+function computeAIControls(dt) {
+	window._aiFinishBoost = false; // reset each tick
+  // --- First-hit kickoff bias state (unchanged behavior) ---
+  if (typeof window.aiBallBiasFrames === 'undefined') window.aiBallBiasFrames = 0;
+  if (state !== window._aiLastState && state === GameState.Playing) {
+    window._aiKickoffArmed = true; window.aiFirstShotDone = false; _armUsersGoalSide();
+  }
+  if (state === GameState.Playing && typeof resetEndsAt !== 'undefined') {
+    if (resetEndsAt !== window._aiLastResetEnds &&
+        (typeof PlayingSubstate === 'undefined' || playSubstate === PlayingSubstate.Active)) {
+      window._aiKickoffArmed = true; window.aiFirstShotDone = false; window._aiLastResetEnds = resetEndsAt; _armUsersGoalSide();
+    }
+  }
+  window._aiLastState = state;
+
+  function _goalBiasTick(){
+    if (!window.aiBallBiasFrames) return;
+    const g = goalCenterForUser();
+    const vx0 = probe.vx, vy0 = probe.vy;
+    const speed = Math.hypot(vx0, vy0) || 1;
+    let ux = g.x - probe.x, uy = g.y - probe.y;
+    const ulen = Math.hypot(ux, uy) || 1; ux /= ulen; uy /= ulen;
+    const step = Math.max(0, Math.min(1, window.aiBallBiasFrames / 3));
+    const BIAS = 0.85 * step; // stronger blend toward goal direction
+	const minKick = 520;      // ensure opening shots carry
+    probe.vx = vx0 * (1 - BIAS) + (ux * Math.max(speed, minKick)) * BIAS;
+    probe.vy = vy0 * (1 - BIAS) + (uy * Math.max(speed, minKick)) * BIAS;
+    window.aiBallBiasFrames = Math.max(0, window.aiBallBiasFrames - 1);
+  }
+
+  if (state !== GameState.Playing) {
+    _goalBiasTick();
+    aiCtl.steer = 0; aiCtl.throttle = 0; aiCtl.prevErr = 0;
+    return { steer: 0, throttle: 0 };
+  }
+if (state !== GameState.Playing) {
+  _goalBiasTick();
+  aiCtl.steer = 0; aiCtl.throttle = 0; aiCtl.prevErr = 0;
+  return { steer: 0, throttle: 0 };
+}
+// === Corner escape override (inputs only; no physics changes) ===
+{
+  const now = performance.now();
+
+  // If currently escaping: reverse while orienting so reverse motion heads toward center.
+  // Note: with this car model, negative throttle accelerates along -heading.
+  // To move toward center while reversing, we face *away* from center and apply reverse.
+  if (now < aiCornerEscapeUntil) {
+    const cx = (inner.left + inner.right) * 0.5;
+const cy = (inner.top  + inner.bottom) * 0.5;
+const desired = Math.atan2(aiCar.pos.y - cy, aiCar.pos.x - cx); // center->car (reverse target)
+const err = normalizeAngle(desired - aiCar.angle);
+
+// Add the fixed random bias picked at trigger time:
+let steer = clamp(err / (Math.PI / 2) + aiCornerEscapeBias, -1, 1);
+
+// Stronger initial reverse for a quick “pop out”, then slightly relax:
+const elapsed = performance.now() - aiCornerEscapeStartMs;
+const throttle = (elapsed < AI_ESCAPE_KICK_MS) ? -1.0 : -0.95;
+
+return { steer, throttle };
+
+  }
+
+  // Detect: slow + in corner zone, sustained for a short linger
+  const speed = Math.hypot(aiCar.vel.x, aiCar.vel.y);
+  const effR  = Math.max(2, CAR_RADIUS - (typeof CAR_HITBOX_SHRINK !== 'undefined' ? CAR_HITBOX_SHRINK : 0));
+  const nearCorner = pointNearAnyCorner(aiCar.pos.x, aiCar.pos.y, effR, AI_CORNER_STUCK_DIST);
+
+  if (speed < AI_CORNER_STUCK_SPEED && nearCorner) {
+    if (!aiCornerStuckStartMs) aiCornerStuckStartMs = now;
+    const linger = now - aiCornerStuckStartMs;
+    const cooled = (now - aiCornerLastEscapeAt) >= AI_CORNER_ESCAPE_COOLDOWN_MS;
+    if (linger >= AI_CORNER_STUCK_LINGER_MS && cooled) {
+      aiCornerEscapeStartMs = now;
+aiCornerEscapeUntil   = now + AI_CORNER_ESCAPE_MS;
+aiCornerLastEscapeAt  = now;
+aiCornerStuckStartMs  = 0;
+
+// Pick a direction once per escape: -bias (left) or +bias (right)
+aiCornerEscapeBias = (Math.random() < 0.5 ? -1 : 1) * AI_ESCAPE_STEER_BIAS;
+
+// Start the escape immediately this frame
+const cx = (inner.left + inner.right) * 0.5;
+const cy = (inner.top  + inner.bottom) * 0.5;
+const desired = Math.atan2(aiCar.pos.y - cy, aiCar.pos.x - cx);
+const err = normalizeAngle(desired - aiCar.angle);
+let steer = clamp(err / (Math.PI / 2) + aiCornerEscapeBias, -1, 1);
+const throttle = -1.0; // hit it hard on the first frame
+return { steer, throttle };
+
+    }
+  } else {
+    aiCornerStuckStartMs = 0;
+  }
+}
+// === End corner escape override ===
+
+  // ----- first-hit trigger (keep as-is) -----
+  if (!window.aiFirstShotDone && hasAIBallContact()) {
+    const fx = Math.cos(aiCar.angle), fy = Math.sin(aiCar.angle);
+    const dx = probe.x - aiCar.pos.x, dy = probe.y - aiCar.pos.y;
+    const dist = Math.hypot(dx, dy) || 1;
+    const nx = dx / dist, ny = dy / dist;
+    const frontCos = fx*nx + fy*ny;
+    const FRONT_CONE_COS = 0.35;
+    window.aiBallBiasFrames = (frontCos >= FRONT_CONE_COS) ? 6 : 4;
+    _goalBiasTick();
+    window.aiFirstShotDone = true; window._aiKickoffArmed = false;
+    aiCtl.steer = 0; aiCtl.throttle = 0; aiCtl.prevErr = 0;
+    window._aiSpinDist = undefined; window._aiSpinT = 0;
+    window._aiNoProgressT = 0; window._aiEscapeT = 0;
+    return { steer: 0, throttle: 0 };
+  }
+  if (!window._aiKickoffArmed && window.aiBallBiasFrames) _goalBiasTick();
+
+  // During kickoff approach: keep your original planning numbers
+  if (window._aiKickoffArmed && !window.aiFirstShotDone) {
+    const MAX_PLAN_T = 1.9, THROUGH_DIST = 60, MIN_FACING_COS = 0.85;
+    const plan  = simInterceptFacing(MAX_PLAN_T, THROUGH_DIST, MIN_FACING_COS);
+    const hitT  = plan.facingHit ? plan.facingHit.t : (plan.anyHit ? plan.anyHit.t : 0.6);
+    const bx    = probe.x; const byHit = predictBallYAt(hitT);
+    const g     = goalCenterForUser();
+    const gx  = g.x - bx, gy = g.y - byHit, gl = Math.hypot(gx, gy) || 1;
+    const ugx = gx/gl,   ugy = gy/gl;
+    const faceAng = Math.atan2(g.y - byHit, g.x - bx);
+
+    const px = aiCar.pos.x, py = aiCar.pos.y;
+    const dBall = Math.hypot(bx - px, byHit - py);
+    const misFaceNow = Math.abs(normalizeAngle(faceAng - aiCar.angle));
+
+    let baseDepth;
+    if (plan.facingHit)      baseDepth = THROUGH_DIST + 40;
+    else if (plan.anyHit)    baseDepth = Math.max(THROUGH_DIST * 0.6, 40);
+    else                     baseDepth = THROUGH_DIST * 0.5;
+
+    const DEPTH_PER_RAD = 70, NEAR_EXTRATHRU_MAX = 24;
+    const nearT = Math.max(0, Math.min(1, (180 - dBall) / 180));
+    const dynamicDepth = baseDepth + DEPTH_PER_RAD * Math.max(0, Math.min(1, misFaceNow / 1.4)) + NEAR_EXTRATHRU_MAX * nearT;
+
+    let targetX = bx - ugx * dynamicDepth;
+    let targetY = byHit - ugy * dynamicDepth;
+
+    const ORIENT_START=260, ORIENT_FULL=110, ORIENT_MAX_RAD=1.15, LOCK_DIST=90, LOCK_ERR=0.35;
+    let tBlend = (ORIENT_START - dBall) / Math.max(1, ORIENT_START - ORIENT_FULL);
+    tBlend = Math.max(0, Math.min(1, tBlend)); tBlend = tBlend*tBlend*(3 - 2*tBlend);
+    const moveAng = Math.atan2(targetY - py, targetX - px);
+    const delta   = normalizeAngle(faceAng - moveAng);
+    let orientedMoveAng = moveAng + Math.max(-ORIENT_MAX_RAD, Math.min(ORIENT_MAX_RAD, delta)) * tBlend;
+
+    const lockT = Math.max(0, Math.min(1, (LOCK_DIST - dBall) / LOCK_DIST));
+    if (lockT > 0) {
+      const dLock = normalizeAngle(faceAng - orientedMoveAng);
+      orientedMoveAng = orientedMoveAng + dLock * (0.65 * lockT);
+    }
+
+    const err = normalizeAngle(orientedMoveAng - aiCar.angle);
+    const steerGain = (typeof AI_STEER_GAIN !== 'undefined') ? AI_STEER_GAIN : 1.0;
+    aiCtl.steer = Math.max(-1, Math.min(1, (err / (Math.PI / 2)) * steerGain));
+
+    const mis = Math.abs(err);
+    let thr = (mis > 1.2) ? 0.5 : (mis > 0.9 ? 0.7 : 1.0);
+    if (dBall < LOCK_DIST && misFaceNow > LOCK_ERR) thr = Math.min(thr, 0.38);
+    if (!plan.facingHit && plan.anyHit) thr = Math.min(thr, 0.9);
+
+    aiCtl.headingErr = err;
+    aiCtl.throttle = thr;
+    return { steer: aiCtl.steer, throttle: aiCtl.throttle };
+  }
+
+    // =================== SIMPLE, DECISIVE CONTROLLER (post-first-hit) ===================
+  // One-step ahead intercept, no reverse/escapes, high throttle floor.
+
+  // Goal dir relative to current ball
+  const userGoal = goalCenterForUser();
+  const goalDir  = Math.sign(userGoal.x - probe.x) || 1;
+
+  // Predict a single ahead point based on car–ball distance and ball speed
+  const lead = AI_aheadPoint(aiCar.pos.x, aiCar.pos.y, probe.x, probe.y, probe.vx, probe.vy);
+  const bx = lead.x, by = lead.y;
+
+  // Are we behind the ball relative to user's goal?
+  const aiBehindBall = (goalDir > 0) ? (aiCar.pos.x < probe.x) : (aiCar.pos.x > probe.x);
+
+  // Unit vector from (predicted) ball to user's goal
+  const gx = userGoal.x - bx, gy = userGoal.y - by;
+  const gl = Math.hypot(gx, gy) || 1; const ugx = gx/gl, ugy = gy/gl;
+
+  // Tight orbit & through offsets (keep orbit; make the strike go deeper)
+const ORBIT = 102;
+const THROUGH = 160; // deeper strike through the ball (was 46)
+
+  // Choose wrap side using signed area test
+  const side = Math.sign((by - aiCar.pos.y) * ugx - (bx - aiCar.pos.x) * ugy) || 1;
+
+  // Target: wrap if on wrong side, otherwise strike through the ball toward goal
+  let targetX, targetY;
+  if (!aiBehindBall) {
+    targetX = bx - ugx * ORBIT;
+    targetY = by - ugy * (ORBIT * 0.45) + side * 60;
+  } else {
+    targetX = bx - ugx * THROUGH;
+    targetY = by - ugy * THROUGH;
+  }
+
+  // Side-wall bias: if the ball is near a side, aim a little inward
+const SIDE_NEAR = 140;  // distance from side that counts as "near"
+const INSET     = 64;   // how far inside the field we'll aim
+if (probe.x < inner.left + SIDE_NEAR) {
+  if (targetX < inner.left + INSET) targetX = inner.left + INSET;
+} else if (probe.x > inner.right - SIDE_NEAR) {
+  if (targetX > inner.right - INSET) targetX = inner.right - INSET;
+}
+
+  // Keep target inside play bounds
+  const PAD = 28;
+  targetX = clamp(targetX, inner.left + PAD, inner.right - PAD);
+  targetY = clamp(targetY, inner.top  + PAD, inner.bottom - PAD);
+  window._aiLastTarget = { x: targetX, y: targetY }; // for spinArrestor
+
+  // Steering: PD + tiny slip feedforward
+  const moveAng = Math.atan2(targetY - aiCar.pos.y, targetX - aiCar.pos.x);
+  let err = normalizeAngle(moveAng - aiCar.angle);
+  const dErr = (err - (aiCtl.prevErr || 0)) / Math.max(dt, 1e-3);
+  aiCtl.prevErr = err;
+
+  const slipFF = normalizeAngle(Math.atan2(aiCar.vel.y, aiCar.vel.x) - aiCar.angle);
+  const Kp=1.00, Kd=0.18, Kf=0.08;
+  aiCtl.steer = clamp(Kp*err + Kd*dErr + Kf*slipFF, -1, 1);
+
+  // Throttle: commit hard; only trim on extreme misalignment
+  let thr = 1.0;
+  const aerr = Math.abs(err);
+  if (aerr > 1.50)      thr = 0.72;
+  else if (aerr > 1.20) thr = 0.85;
+
+  // High floor removes hesitation on long arcs
+  if (thr < 0.92) thr = 0.92;
+
+  aiCtl.throttle = thr;
+  return { steer: aiCtl.steer, throttle: aiCtl.throttle };
+}
+
+// ========================= [AI: POST-CONTACT MICRO-NUDGE] =========================
+// Tiny, safe nudge after AI–ball contact (≤2 frames) and ONLY after first hit.
+// Never toward own goal; small caps.
+if (typeof window._aiPrevContact === 'undefined') window._aiPrevContact = false;
+if (typeof window.aiNudgeFrames  === 'undefined') window.aiNudgeFrames  = 0;
+if (typeof window.aiShotAim      === 'undefined') window.aiShotAim      = {x:0,y:0};
+
+function ai_pickShotAim(){
+  const shot = ai_planShot();
+  if (shot) return shot.aim;
+  // Fallback: direct far-post
+  const m = userGoalMouth();
+  return { x: m.gx, y: farPostY(probe.y) };
+}
+
+function ai_tickNudge(){
+  const QUALITY_MIN_DOT = 0.12; // accept slightly rougher alignments
+
+  const contact = hasAIBallContact();
+  if (contact && !window._aiPrevContact && window.aiFirstShotDone) {
+    window.aiShotAim = ai_pickShotAim();
+    window.aiNudgeFrames = AI_FEATURE_SMART_NUDGE ? 3 : 2;
+  }
+  window._aiPrevContact = contact;
+  if (!window.aiNudgeFrames) return;
+
+  const aim = window.aiShotAim || ai_pickShotAim();
+  const ux = aim.x - probe.x, uy = aim.y - probe.y;
+  const ul = Math.hypot(ux, uy) || 1;
+  const gx = ux / ul, gy = uy / ul;
+
+  const userGoal = goalCenterForUser();
+  const goalDir = Math.sign(userGoal.x - probe.x) || 1;
+  if ((goalDir > 0 && gx < 0) || (goalDir < 0 && gx > 0)) { window.aiNudgeFrames = 0; return; }
+
+  const speed = Math.hypot(probe.vx, probe.vy);
+  const speedFrac = Math.min(1, speed / (probe.maxSpeed || 900));
+  const m = userGoalMouth();
+  const distGoal = Math.abs(probe.x - m.gx);
+  const nearGoalScale = clamp(1 - distGoal / (ARENA_W * 0.6), 0, 1);
+
+  const MAX_DV_BASE = 160;
+  const MAX_DV = MAX_DV_BASE + (AI_FEATURE_SMART_NUDGE ? 70 * nearGoalScale + 50 * (1 - speedFrac) : 0);
+  const vdot = (probe.vx * gx + probe.vy * gy) / (speed + 1e-6);
+  if (vdot < -0.6 || Math.abs(gx) < QUALITY_MIN_DOT) { window.aiNudgeFrames = 0; return; }
+
+  const dvx = gx * MAX_DV * 0.5, dvy = gy * MAX_DV * 0.5;
+  const blend = 0.34 + (AI_FEATURE_SMART_NUDGE ? 0.06 * nearGoalScale : 0);
+  probe.vx = probe.vx * (1 - blend) + dvx * blend;
+  probe.vy = probe.vy * (1 - blend) + dvy * blend;
+
+  window.aiNudgeFrames = Math.max(0, window.aiNudgeFrames - 1);
+}
+
+/* === AI-only pivot assist (post-first-hit) === */
+/* Tightens turn-in near the ball without changing top speed/accel. */
+function ai_pivotAssist(dt){
+  // Default: not pivoting this frame
+  window._aiPivoting = false;
+
+  if (!AI_PIVOT_ON) return;
+  if (!window.aiFirstShotDone) return;           // keep kickoff behavior untouched
+  if (window._aiKickoffArmed) return;            // still in first approach? skip
+
+  // Use the latest live target if available; else fall back to ball
+  const tgt = (window._aiLastTarget && window._aiLastTarget.x != null)
+    ? window._aiLastTarget
+    : { x: probe.x, y: probe.y };
+
+  const toTgtAng = Math.atan2(tgt.y - aiCar.pos.y, tgt.x - aiCar.pos.x);
+  const err = normalizeAngle(toTgtAng - aiCar.angle);
+  const absErr = Math.abs(err);
+
+  const dBall = Math.hypot(probe.x - aiCar.pos.x, probe.y - aiCar.pos.y);
+  const speed = Math.hypot(aiCar.vel.x, aiCar.vel.y);
+
+  // "Wrong side" test (§ mirrors your computeAIControls logic)
+  const userGoal = goalCenterForUser();
+  const goalDir  = Math.sign(userGoal.x - probe.x) || 1;
+  const wrongSide = (goalDir > 0) ? (aiCar.pos.x >= probe.x) : (aiCar.pos.x <= probe.x);
+
+  // Slip (sideways) magnitude
+  const fx = Math.cos(aiCar.angle), fy = Math.sin(aiCar.angle);
+  const vL = -aiCar.vel.x * fy + aiCar.vel.y * fx;     // lateral component in car frame
+  const slipRad = Math.abs(normalizeAngle(Math.atan2(aiCar.vel.y, aiCar.vel.x) - aiCar.angle));
+
+  // Engage when close, misaligned, and either slipping or on the wrong side
+  const inRange = (dBall < AI_PIVOT_DIST);
+  const misaligned = (absErr > AI_PIVOT_ERR_RAD) || (slipRad > 0.9);
+  if (!(inRange && misaligned && (wrongSide || slipRad > 0.7))) return;
+
+  window._aiPivoting = true; // let the clamp below know we’re pivoting
+
+  // --- (A) Yaw boost: add extra angular velocity toward the move direction ---
+  const MIN_TURN_FACTOR_AI = 0.35;
+  const sfAI   = clamp(speed / CAR_TURN_REFSPD, 0, 1);
+  const turnRT = CAR_TURN_RATE * (MIN_TURN_FACTOR_AI + (1 - MIN_TURN_FACTOR_AI) * sfAI);
+  const desiredAV = clamp(err / (Math.PI / 2), -1, 1) * turnRT;
+
+  // Ease the boost in with proximity & error so it reads as plausible traction
+  const nearK   = clamp((AI_PIVOT_DIST - dBall) / AI_PIVOT_DIST, 0, 1);
+  const errK    = clamp((absErr - 0.35) / (Math.PI - 0.35), 0, 1);
+  const yawGain = AI_PIVOT_YAW_GAIN * (0.5 + 0.5 * nearK) * (0.6 + 0.4 * errK);
+
+  const targetAV = desiredAV * (1 + yawGain);
+  aiCar.angularVel += (targetAV - aiCar.angularVel) * Math.min(1, 22.0 * dt); // snappier than base
+
+  // --- (B) Traction glue: trim lateral velocity harder while pivoting ---
+  if (speed > 1e-3) {
+    const tvx = fx * speed, tvy = fy * speed; // pure heading velocity at same speed
+    const k = AI_PIVOT_GLUE * dt;             // extra blend on top of base steer-assist
+    aiCar.vel.x += (tvx - aiCar.vel.x) * k;
+    aiCar.vel.y += (tvy - aiCar.vel.y) * k;
+  }
+
+  // --- (C) In‑place brake: when very close & still misaligned, shave speed to stop looping ---
+  if (dBall < AI_PIVOT_BRAKE_DIST && absErr > 0.9) {
+    let sp = Math.hypot(aiCar.vel.x, aiCar.vel.y);
+    if (sp > 1e-3) {
+      const nx = aiCar.vel.x / sp, ny = aiCar.vel.y / sp;
+      const newSp = Math.max(0, sp - AI_PIVOT_BRAKE_DECEL * dt);
+      aiCar.vel.x = nx * newSp; aiCar.vel.y = ny * newSp;
+    }
+  }
+
+  // Local AV clamp (higher while pivoting, but still bounded)
+  const MAX_AV = CAR_TURN_RATE * AI_PIVOT_MAX_AV_SCALE;
+  if (aiCar.angularVel >  MAX_AV) aiCar.angularVel =  MAX_AV;
+  if (aiCar.angularVel < -MAX_AV) aiCar.angularVel = -MAX_AV;
+}
+
+
+// ========================= [UPDATE: FIXED STEP] =========================
+function updateFixed(dt) {
+  if (state !== GameState.Playing) return;
+
+  // --- Regulation timer (ticks only during Active, not paused, not sudden death) ---
+  if (!TIMER_PAUSED && playSubstate === PlayingSubstate.Active && !suddenDeath) {
+    timeLeft -= dt;
+    if (timeLeft <= 0) {
+      timeLeft = 0;
+      if (scoreLeft === scoreRight) {
+        // Enter golden goal + start short overlay flash
+        suddenDeath = true;
+        suddenDeathStartedAt = performance.now();  // <-- NEW
+      } else {
+        state = GameState.Ended;
+        endBanner = (scoreLeft > scoreRight) ? 'You win!' : 'You lose.';
+        return;
+      }
+    }
+  }
+
+  // Freeze gameplay during post-score countdown OR during the 2s sudden-death overlay flash
+  const flashingSD = suddenDeath && ((performance.now() - suddenDeathStartedAt) < SUDDEN_DEATH_FLASH_MS);
+  if (playSubstate === PlayingSubstate.Resetting || flashingSD) return;
+
+  // ----- CAR CONTROL (player) -----
+  const throttle = (keys.has('arrowup') ? 1 : 0) + (keys.has('arrowdown') ? -1 : 0);
+  const steer    = (keys.has('arrowleft') ? -1 : 0) + (keys.has('arrowright') ? 1 : 0);
+
+  const cosA = Math.cos(car.angle), sinA = Math.sin(car.angle);
+  const accelMag = throttle >= 0 ? CAR_ACCEL : CAR_REVERSE_ACCEL;
+  car.vel.x += cosA * (accelMag * throttle) * dt;
+  car.vel.y += sinA * (accelMag * throttle) * dt;
+
+  // Linear damping + extra rolling decel (opposes velocity)
+  car.vel.x *= CAR_STEP_FRIC_LIN;
+  car.vel.y *= CAR_STEP_FRIC_LIN;
+  const sp = Math.hypot(car.vel.x, car.vel.y);
+  if (sp > 1e-3) {
+    const dec = CAR_ROLLING_DECEL * dt;
+    const nx = car.vel.x / sp, ny = car.vel.y / sp;
+    const newSp = Math.max(0, sp - dec);
+    car.vel.x = nx * newSp; car.vel.y = ny * newSp;
+  }
+
+  // Steer assist: trim velocity toward heading while steering
+  const STEER_ASSIST = 4.0; // try 3–6
+  if (Math.abs(steer) > 0 && sp > 1e-3) {
+    const targetVX = Math.cos(car.angle) * sp;
+    const targetVY = Math.sin(car.angle) * sp;
+    const k = STEER_ASSIST * dt;
+    car.vel.x += (targetVX - car.vel.x) * k;
+    car.vel.y += (targetVY - car.vel.y) * k;
+  }
+
+  // Speed clamp
+  if (car.vel.x*car.vel.x + car.vel.y*car.vel.y > CAR_MAX_SPEED*CAR_MAX_SPEED) {
+    const s = CAR_MAX_SPEED / Math.hypot(car.vel.x, car.vel.y);
+    car.vel.x *= s; car.vel.y *= s;
+  }
+
+  // Steering: full rate at speed, reduced at very low speed
+  const MIN_TURN_FACTOR = 0.6;
+  const speedFactor = clamp(sp / CAR_TURN_REFSPD, 0, 1);
+  const turnRate = CAR_TURN_RATE * (MIN_TURN_FACTOR + (1 - MIN_TURN_FACTOR) * speedFactor);
+  const targetAV = steer * turnRate;
+  const ANG_RESPONSE = 18.0; // snappy response
+  car.angularVel += (targetAV - car.angularVel) * Math.min(1, ANG_RESPONSE * dt);
+  car.angularVel *= CAR_STEP_FRIC_ANG;
+  car.angle += car.angularVel * dt;
+
+  // Integrate car position + collide with walls using rotated-rect AABB (no visual gap)
+  car.pos.x += car.vel.x * dt; 
+  car.pos.y += car.vel.y * dt;
+  {
+    const r = collideCarOBBInnerRect(car.pos.x, car.pos.y, car.angle, car.vel.x, car.vel.y);
+    car.pos.x = r.px; car.pos.y = r.py; car.vel.x = r.vx; car.vel.y = r.vy;
+  }
+
+  // ----- AI CONTROL + PHYSICS (mirrors player pipeline; braking allowed outside brief no-reverse) -----
+  const aiInputs = computeAIControls(dt);
+  const aiThrottle = clamp(aiInputs.throttle, -1, 1);
+  const aiSteer    = clamp(aiInputs.steer,    -1, 1);
+
+  // Accel in heading (allow reverse for braking; computeAIControls already suppresses during kickoff window)
+  const aiCos = Math.cos(aiCar.angle), aiSin = Math.sin(aiCar.angle);
+  const accelMagAI = aiThrottle >= 0 ? CAR_ACCEL : CAR_REVERSE_ACCEL;
+  aiCar.vel.x += aiCos * (accelMagAI * aiThrottle) * dt;
+  aiCar.vel.y += aiSin * (accelMagAI * aiThrottle) * dt;
+
+  // Damping + rolling decel
+  aiCar.vel.x *= CAR_STEP_FRIC_LIN;
+  aiCar.vel.y *= CAR_STEP_FRIC_LIN;
+  let aiSp = Math.hypot(aiCar.vel.x, aiCar.vel.y);
+  if (aiSp > 1e-3) {
+    const dec = CAR_ROLLING_DECEL * dt;
+    const nx = aiCar.vel.x / aiSp, ny = aiCar.vel.y / aiSp;
+    const newSp = Math.max(0, aiSp - dec);
+    aiCar.vel.x = nx * newSp; aiCar.vel.y = ny * newSp;
+    aiSp = newSp;
+  }
+
+  // Steer assist
+  if (Math.abs(aiSteer) > 0 && aiSp > 1e-3) {
+    const targetVX = Math.cos(aiCar.angle) * aiSp;
+    const targetVY = Math.sin(aiCar.angle) * aiSp;
+    const k = 4.0 * dt;
+    aiCar.vel.x += (targetVX - aiCar.vel.x) * k;
+    aiCar.vel.y += (targetVY - aiCar.vel.y) * k;
+  }
+
+// Turn dynamics
+const MIN_TURN_FACTOR_AI = window.aiFirstShotDone ? 0.50 : 0.35;
+const sfAI = clamp(aiSp / CAR_TURN_REFSPD, 0, 1);
+const turnRateAI = CAR_TURN_RATE * (MIN_TURN_FACTOR_AI + (1 - MIN_TURN_FACTOR_AI) * sfAI);
+const targetAV_AI = aiSteer * turnRateAI;
+
+
+  // Regular AV response
+aiCar.angularVel += (targetAV_AI - aiCar.angularVel) * Math.min(1, 18.0 * dt);
+aiCar.angularVel *= CAR_STEP_FRIC_ANG;
+
+// Engage the already-implemented pivot/traction assist near the ball (post-first-hit)
+ai_pivotAssist(dt);
+
+
+  // Spin arrestor: if we’re turning hard but not closing distance to the live target, cut AV
+  (function spinArrestor(){
+    const MAX_AV = CAR_TURN_RATE * (window._aiPivoting ? AI_PIVOT_MAX_AV_SCALE : 1.2);
+    if (typeof window._aiLastTarget === 'object') {
+      const dx = window._aiLastTarget.x - aiCar.pos.x;
+      const dy = window._aiLastTarget.y - aiCar.pos.y;
+      const dist = Math.hypot(dx, dy);
+
+      if (typeof window._aiSpinDist === 'undefined') window._aiSpinDist = dist;
+      if (typeof window._aiSpinT === 'undefined')    window._aiSpinT = 0;
+
+      const closing = (dist <= window._aiSpinDist + 1.0); // allow small jitter
+      if (!closing && Math.abs(aiCar.angularVel) > CAR_TURN_RATE * 0.8) {
+        window._aiSpinT += dt;
+      } else {
+        window._aiSpinT = Math.max(0, window._aiSpinT - dt * 0.5);
+      }
+      window._aiSpinDist = dist;
+
+      // If we’ve been spinning for > ~0.35s without closing, damp AV toward targetAV
+      if (window._aiSpinT > 0.35) {
+        aiCar.angularVel = lerp(aiCar.angularVel, targetAV_AI * 0.6, Math.min(1, 10 * dt));
+        window._aiSpinT = 0.3; // decay so it can recover
+      }
+    }
+
+    // Absolute AV safety clamp
+    if (aiCar.angularVel >  MAX_AV) aiCar.angularVel =  MAX_AV;
+    if (aiCar.angularVel < -MAX_AV) aiCar.angularVel = -MAX_AV;
+  })();
+
+  aiCar.angle += aiCar.angularVel * dt;
+
+
+  // Integrate + collide with walls using rotated-rect AABB (no visual gap)
+  aiCar.pos.x += aiCar.vel.x * dt;
+  aiCar.pos.y += aiCar.vel.y * dt;
+  {
+    const rr = collideCarOBBInnerRect(aiCar.pos.x, aiCar.pos.y, aiCar.angle, aiCar.vel.x, aiCar.vel.y);
+    aiCar.pos.x = rr.px; aiCar.pos.y = rr.py; aiCar.vel.x = rr.vx; aiCar.vel.y = rr.vy;
+  }
+
+  // Top speed cap for AI (let AI exceed player cap intentionally)
+	const cap = AI_TOP_SPEED;
+  const aiSp2 = Math.hypot(aiCar.vel.x, aiCar.vel.y);
+  if (aiSp2 > cap) { const s = cap / aiSp2; aiCar.vel.x *= s; aiCar.vel.y *= s; }
+
+  // ----- CAR–CAR (capture AI pre-impact for bump detection) -----
+  const aiPreVX = aiCar.vel.x, aiPreVY = aiCar.vel.y;
+
+resolveCarCar();
+
+// ----- BALL (capture ball pre-impact for miss/bump heuristics) -----
+probe.vx *= STEP_FRICTION;
+probe.vy *= STEP_FRICTION;
+probe.x  += probe.vx * dt;
+probe.y  += probe.vy * dt;
+updateBallVsWalls();
+kickBallOutOfCorners(performance.now());
+const ballPreVX = probe.vx, ballPreVY = probe.vy;
+
+
+// ----- CAR–BALL (player then AI) -----
+resolveCarBall();              // player
+resolveCarBallWith(aiCar);     // AI
+
+// ----- BUMP/MISS HOOK (stateless): only compute; no AI state mutations needed now -----
+{
+  // Telemetry only; does not change AI state
+  const dV = Math.hypot(aiCar.vel.x - aiPreVX, aiCar.vel.y - aiPreVY);
+  const ballDirDot = (ballPreVX*probe.vx + ballPreVY*probe.vy) /
+                     (Math.hypot(ballPreVX, ballPreVY) * Math.hypot(probe.vx, probe.vy) + 1e-6);
+}
+
+// Run AI micro-nudge after physics (AI-only)
+ai_tickNudge();
+
+// === close updateFixed(dt) ===
+}
+
+
+
+// ========================= [RENDER: FRAME] =========================
+function render() {
+  // Clear + top bar
+  ctx.fillStyle = '#0b0e14'; ctx.fillRect(0,0,INTERNAL_W,INTERNAL_H);
+  ctx.fillStyle = '#101521'; ctx.fillRect(0,0,INTERNAL_W,48);
+
+  // World
+  drawArenaWithGoals();
+
+  // Entities
+  drawDisc(probe.x, probe.y, probe.r, '#cbd5e1', '#0f172a'); // ball
+  drawAICar();                                               // AI car (right)
+  drawCar();                                                 // player car (left)
+
+  // ========================= [RENDER: TEXT & HUD] =========================
+
+  // Scoreboard (top-center)
+  ctx.fillStyle = '#cbd5e1';
+  ctx.font = '20px Menlo, Consolas, monospace';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  ctx.fillText(`${scoreLeft}  :  ${scoreRight}`, INTERNAL_W / 2, 10);
+
+  // Match timer (top-right) — M:SS
+  ctx.textAlign = 'right';
+  const t = Math.max(0, Math.floor(timeLeft));
+  const mm = Math.floor(t / 60);
+  const ss = t % 60;
+  const clock = `${mm}:${ss.toString().padStart(2,'0')}`;
+  ctx.fillText(clock, INTERNAL_W - 16, 10);
+
+  // State banners / overlays
+  if (state === GameState.Menu) {
+    drawCenterText('Bumper Ball', INTERNAL_H/2 - 10, 28, '#e8e9ee');
+    drawCenterText('Press Enter to Start', INTERNAL_H/2 + 22, 16, '#aab3c5');
+
+  } else if (state === GameState.Playing) {
+    // Small help label
+    drawCornerLabel(16,16,'Up/Down: throttle · Left/Right: steer');
+
+    // Sudden death UI: brief fullscreen flash, then centered top label (below score)
+    if (suddenDeath) {
+      const now = performance.now();
+      const flashing = (now - suddenDeathStartedAt) < SUDDEN_DEATH_FLASH_MS;
+
+      if (flashing) {
+        // Dim screen + big center text (2s flash)
+        ctx.fillStyle = 'rgba(0,0,0,0.45)';
+        ctx.fillRect(0, 0, INTERNAL_W, INTERNAL_H);
+        drawCenterText('SUDDEN DEATH!', INTERNAL_H/2, 64, '#ffdd57');
+      } else {
+        // Centered just under the top bar & clock/score
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        ctx.font = '28px Menlo, Consolas, monospace';
+        ctx.fillStyle = '#ffdd57';
+        const overlayY = 56; // 48px bar + 8px padding
+        ctx.fillText('SUDDEN DEATH', INTERNAL_W / 2, overlayY);
+      }
+    }
+
+    // Countdown overlay while Resetting
+    if (playSubstate === PlayingSubstate.Resetting) {
+      const nowMs   = performance.now();
+      const msLeft  = Math.max(0, resetEndsAt - nowMs);
+      const tickDur = Math.max(1, RESET_PAUSE_MS / COUNTDOWN_TICKS); // avoid div-by-zero
+
+      // If time elapsed, flip state first (prevents getting stuck showing "1")
+      if (msLeft <= 0) {
+        playSubstate = PlayingSubstate.Active;
+
+        // Ensure spawn at true center
+        probe.x = arena.x + ARENA_W / 2;
+        probe.y = arena.y + ARENA_H / 2;
+
+        // Launch vertically only; no horizontal bias
+        probe.vx = 0;
+        const s = MIN_Y_SPEED + Math.random() * (MAX_Y_SPEED - MIN_Y_SPEED);
+        const dir = Math.random() < 0.5 ? -1 : 1; // -1 = up, 1 = down (canvas Y grows down)
+        probe.vy = dir * s;
+
+      } else {
+        // Compute visible digit strictly from remaining time (3..2..1), clamped
+        const currentTick = Math.max(
+          1,
+          Math.min(COUNTDOWN_TICKS, Math.ceil(msLeft / tickDur))
+        );
+
+        // Dim background
+        ctx.fillStyle = 'rgba(0,0,0,0.45)';
+        ctx.fillRect(0, 0, INTERNAL_W, INTERNAL_H);
+
+        // Big countdown number
+        ctx.fillStyle = '#e8e9ee';
+        ctx.font = 'bold 96px/1 system-ui,-apple-system,Segoe UI,Roboto,Arial';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText(String(currentTick), INTERNAL_W/2, INTERNAL_H/2);
+      }
+    }
+
+  } else if (state === GameState.Ended) {
+    drawCenterText(endBanner || 'Ended', INTERNAL_H/2 - 14, 36, '#e8e9ee');
+    drawCenterText('Press R to Restart', INTERNAL_H/2 + 26, 18, '#aab3c5');
+  }
+}
+
+
+  // ========================= [RENDER: ARENA & GOALS] =========================
+  function drawArenaWithGoals() {
+    ctx.fillStyle = '#0f1524';
+    ctx.fillRect(arena.x, arena.y, ARENA_W, ARENA_H);
+
+    const gTop = goals.left.y, gBot = goals.left.y + goals.left.h;
+    ctx.fillStyle = '#1b2233';
+    // Top/Bottom
+    ctx.fillRect(arena.x, arena.y, ARENA_W, WALL_THICKNESS);
+    ctx.fillRect(arena.x, arena.y + ARENA_H - WALL_THICKNESS, ARENA_W, WALL_THICKNESS);
+    // Left (gap)
+    ctx.fillRect(arena.x, arena.y, WALL_THICKNESS, gTop - arena.y);
+    ctx.fillRect(arena.x, gBot, WALL_THICKNESS, arena.y + ARENA_H - gBot);
+    // Right (gap)
+    ctx.fillRect(arena.x + ARENA_W - WALL_THICKNESS, arena.y, WALL_THICKNESS, gTop - arena.y);
+    ctx.fillRect(arena.x + ARENA_W - WALL_THICKNESS, gBot, WALL_THICKNESS, arena.y + ARENA_H - gBot);
+
+    // Goals
+    ctx.fillStyle = goals.left.color;  ctx.fillRect(goals.left.x, goals.left.y, goals.left.w, goals.left.h);
+    ctx.fillStyle = goals.right.color; ctx.fillRect(goals.right.x, goals.right.y, goals.right.w, goals.right.h);
+
+    // Midline
+    ctx.fillStyle = '#162035';
+    ctx.fillRect(arena.x + ARENA_W/2 - 2, arena.y + WALL_THICKNESS, 4, ARENA_H - WALL_THICKNESS*2);
+  }
+
+  // ========================= [RENDER: PRIMITIVES] =========================
+  function drawDisc(x, y, r, fill, stroke) {
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2); ctx.closePath();
+    ctx.fillStyle = fill; ctx.fill();
+    if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = 2; ctx.stroke(); }
+  }
+
+  // ========================= [RENDER: CAR] =========================
+  function drawCar() {
+    // w = 1.6R, h = 1.2R → body fits within circle collider (hit anywhere collides)
+    const bodyW = 1.6 * CAR_RADIUS;
+    const bodyH = 1.2 * CAR_RADIUS;
+    const corner = Math.min(16, bodyH*0.4);
+
+    ctx.save();
+    ctx.translate(car.pos.x, car.pos.y);
+    ctx.rotate(car.angle);
+
+    // Body
+    roundRectPath(ctx, -bodyW/2, -bodyH/2, bodyW, bodyH, corner);
+    ctx.fillStyle = '#2a9d8f'; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = '#1f2a44'; ctx.stroke();
+
+    // Front bumper highlight
+    roundRectPath(ctx, bodyW*0.18 - bodyW/2, -bodyH*0.45, bodyW*0.26, bodyH*0.9, Math.min(10, bodyH*0.25));
+    ctx.fillStyle = '#cbd5e1'; ctx.fill();
+
+    // // Debug: collider
+    // drawDisc(0,0,CAR_RADIUS,'rgba(255,255,255,0.12)');
+
+    ctx.restore();
+  }
+
+  // ========================= [RENDER: AI CAR] =========================
+function drawAICar() {
+  // same geometry as player; distinct color
+  const bodyW = 1.6 * CAR_RADIUS;
+  const bodyH = 1.2 * CAR_RADIUS;
+  const corner = Math.min(16, bodyH*0.4);
+
+  ctx.save();
+  ctx.translate(aiCar.pos.x, aiCar.pos.y);
+  ctx.rotate(aiCar.angle);
+
+  // Body
+  roundRectPath(ctx, -bodyW/2, -bodyH/2, bodyW, bodyH, corner);
+  ctx.fillStyle = '#e76f51'; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = '#1f2a44'; ctx.stroke();
+
+  // Front bumper highlight (kept)
+  roundRectPath(ctx, bodyW*0.18 - bodyW/2, -bodyH*0.45, bodyW*0.26, bodyH*0.9, Math.min(10, bodyH*0.25));
+  ctx.fillStyle = '#fbd1c7'; ctx.fill();
+
+  // (Removed heading indicator/white rod)
+
+  ctx.restore();
+}
+
+
+  // ========================= [RENDER: TEXT & HUD] =========================
+  function roundRectPath(c, x, y, w, h, r) {
+    const rr = Math.min(r, w/2, h/2);
+    c.beginPath();
+    c.moveTo(x+rr, y);
+    c.lineTo(x+w-rr, y);
+    c.quadraticCurveTo(x+w, y, x+w, y+rr);
+    c.lineTo(x+w, y+h-rr);
+    c.quadraticCurveTo(x+w, y+h, x+w-rr, y+h);
+    c.lineTo(x+rr, y+h);
+    c.quadraticCurveTo(x, y+h, x, y+h-rr);
+    c.lineTo(x, y+rr);
+    c.quadraticCurveTo(x, y, x+rr, y);
+    c.closePath();
+  }
+  function drawCenterText(t, y, size, color) {
+    ctx.fillStyle = color || '#fff';
+    ctx.font = `bold ${size}px/1 system-ui,-apple-system,Segoe UI,Roboto,Arial`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(t, INTERNAL_W/2, y);
+  }
+  function drawCornerLabel(x, y, text) {
+    ctx.fillStyle = '#cbd5e1';
+    ctx.font = '14px Segoe UI, Roboto, Arial';
+    ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    ctx.fillText(text, x, y);
+  }
+  </script>
+
+
+</body></html>
