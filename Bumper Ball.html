@@ -701,19 +701,13 @@ function collideCarOBBInnerRect(px, py, angle, vx, vy, bounce=CAR_BOUNCE, tangen
     const sp = Math.hypot(vx, vy);
     if (sp > CAR_MAX_SPEED) { const s = CAR_MAX_SPEED / sp; vx *= s; vy *= s; }
   }
-  // Small positional nudge to avoid sticky edges
-if (typeof CAR_IMPULSE_PUSH !== 'undefined' && typeof DT !== 'undefined') {
-  px += nx * CAR_IMPULSE_PUSH * DT;
-  py += ny * CAR_IMPULSE_PUSH * DT;
-}
 
-// Extra outward kick if we hit a geometric corner (both axes clamped)
-if (nx !== 0 && ny !== 0) {
-  const OUT_KICK = 26; // small: just enough to break jackknife
-  vx += nx * OUT_KICK;
-  vy += ny * OUT_KICK;
-}
-
+  // Extra outward kick if we hit a geometric corner (both axes clamped)
+  if (nx !== 0 && ny !== 0) {
+    const OUT_KICK = 26; // small: just enough to break jackknife
+    vx += nx * OUT_KICK;
+    vy += ny * OUT_KICK;
+  }
 
   return { px, py, vx, vy };
 }
@@ -1263,11 +1257,6 @@ function computeAIControls(dt) {
     aiCtl.steer = 0; aiCtl.throttle = 0; aiCtl.prevErr = 0;
     return { steer: 0, throttle: 0 };
   }
-if (state !== GameState.Playing) {
-  _goalBiasTick();
-  aiCtl.steer = 0; aiCtl.throttle = 0; aiCtl.prevErr = 0;
-  return { steer: 0, throttle: 0 };
-}
 // === Corner escape override (inputs only; no physics changes) ===
 {
   const now = performance.now();
