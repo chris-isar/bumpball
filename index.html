@@ -12,47 +12,12 @@
     canvas { display: block; image-rendering: auto; outline: 1px solid #222833; background: #0a0c10;
       border-radius: 8px; box-shadow: 0 0 0 1px #0a0c10, 0 12px 40px rgba(0,0,0,.5); }
     .hint { position: fixed; left: 12px; bottom: 10px; font-size: 12px; opacity: .65; user-select: none; }
-    .controls { position: fixed; top: 16px; left: 16px; width: 240px; padding: 14px 16px; border-radius: 12px;
-      background: rgba(18, 20, 27, 0.85); border: 1px solid #222833; box-shadow: 0 14px 44px rgba(0,0,0,.45);
-      color: #e8e9ee; font-size: 13px; line-height: 1.35; z-index: 50; backdrop-filter: blur(6px); }
-    .controls .panel-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em;
-      margin-bottom: 10px; color: #82899a; }
-    .controls .control { margin-bottom: 14px; }
-    .controls .control:last-child { margin-bottom: 0; }
-    .controls .label-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;
-      font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: #b6bcc8; }
-    .controls .control-value { font-variant-numeric: tabular-nums; color: #f6f7fb; }
-    .controls input[type="range"] { width: 100%; accent-color: #5a9dfc; cursor: pointer; }
   </style>
 </head>
 <body>
   <!-- ========================= [CANVAS ROOT] ========================= -->
   <div class="wrap">
     <canvas id="game" width="2880" height="1620" aria-label="Game canvas" style="width: 2273.78px; height: 1279px;"></canvas>
-  </div>
-  <div class="controls" id="physicsControls" aria-label="Ball physics tuning panel">
-    <div class="panel-title">Ball physics</div>
-    <div class="control">
-      <div class="label-row">
-        <span>Half-life</span>
-        <span class="control-value" id="halfLifeValue">0</span>
-      </div>
-      <input type="range" id="halfLifeSlider" min="0.5" max="12" step="0.1" aria-label="Ball half-life slider">
-    </div>
-    <div class="control">
-      <div class="label-row">
-        <span>Elasticity</span>
-        <span class="control-value" id="elasticityValue">0</span>
-      </div>
-      <input type="range" id="elasticitySlider" min="0.5" max="1.05" step="0.01" aria-label="Ball elasticity slider">
-    </div>
-    <div class="control">
-      <div class="label-row">
-        <span>Wall tangential loss</span>
-        <span class="control-value" id="tangentValue">0%</span>
-      </div>
-      <input type="range" id="tangentSlider" min="0" max="0.8" step="0.01" aria-label="Wall tangential loss slider">
-    </div>
   </div>
   <div class="hint">Enter: start · R: restart · Arrows: Up/Down throttle, Left/Right steer</div>
 
@@ -98,91 +63,13 @@ let suddenDeathStartedAt = 0;       // timestamp when SD begins
 
  // ========================= [CONSTANTS: TIMESTEP & BALL] =========================
 const DT = 1/120;                    // fixed-step
-let ballDragPerSec = 0.92;           // per-second linear drag for ball (tune 0.88–0.96)
-let ballElasticity = 0.90;           // ball-wall restitution
-let ballWallTangentLoss = 0.0;       // fraction of tangential speed lost on wall hits
-let ballStepFriction = Math.pow(ballDragPerSec, DT); // ← applied every fixed step
-function halfLifeFromDrag(perSecond) {
-  if (perSecond <= 0) return 0;
-  if (perSecond === 1) return Infinity;
-  return Math.log(0.5) / Math.log(perSecond);
-}
-let ballHalfLifeSeconds = halfLifeFromDrag(ballDragPerSec);
-function setBallHalfLife(seconds) {
-  const clamped = Math.max(0.05, seconds || 0);
-  ballHalfLifeSeconds = clamped;
-  ballDragPerSec = Math.pow(0.5, 1 / clamped);
-  ballStepFriction = Math.pow(ballDragPerSec, DT);
-}
-function setBallElasticity(value) {
-  const clamped = Math.max(0, Math.min(1.3, value));
-  ballElasticity = clamped;
-}
-function setBallTangentialLoss(value) {
-  const clamped = Math.max(0, Math.min(0.95, value));
-  ballWallTangentLoss = clamped;
-}
-setBallElasticity(ballElasticity);
-setBallTangentialLoss(ballWallTangentLoss);
-setBallHalfLife(ballHalfLifeSeconds);
-function initPhysicsControls() {
-  const panel = document.getElementById('physicsControls');
-  if (!panel) return;
-  const halfLifeSlider = panel.querySelector('#halfLifeSlider');
-  const elasticitySlider = panel.querySelector('#elasticitySlider');
-  const tangentSlider = panel.querySelector('#tangentSlider');
-  const halfLifeValue = panel.querySelector('#halfLifeValue');
-  const elasticityValue = panel.querySelector('#elasticityValue');
-  const tangentValue = panel.querySelector('#tangentValue');
-  if (!halfLifeSlider || !elasticitySlider || !tangentSlider ||
-      !halfLifeValue || !elasticityValue || !tangentValue) return;
-
-  const formatSeconds = (seconds) => {
-    if (!Number.isFinite(seconds)) return '∞';
-    const rounded = Math.round(seconds * 100) / 100;
-    return rounded.toString();
-  };
-  const updateHalfLifeLabel = () => {
-    halfLifeValue.textContent = `${formatSeconds(ballHalfLifeSeconds)} s`;
-  };
-  const updateElasticityLabel = () => {
-    elasticityValue.textContent = ballElasticity.toFixed(2);
-  };
-  const updateTangentLabel = () => {
-    tangentValue.textContent = Math.round(ballWallTangentLoss * 100) + '%';
-  };
-
-  halfLifeSlider.value = ballHalfLifeSeconds.toFixed(2);
-  elasticitySlider.value = ballElasticity.toFixed(2);
-  tangentSlider.value = ballWallTangentLoss.toFixed(2);
-  updateHalfLifeLabel();
-  updateElasticityLabel();
-  updateTangentLabel();
-
-  halfLifeSlider.addEventListener('input', (event) => {
-    const seconds = parseFloat(event.target.value);
-    if (!Number.isFinite(seconds)) return;
-    setBallHalfLife(seconds);
-    halfLifeSlider.value = ballHalfLifeSeconds.toFixed(2);
-    updateHalfLifeLabel();
-  });
-
-  elasticitySlider.addEventListener('input', (event) => {
-    const value = parseFloat(event.target.value);
-    if (!Number.isFinite(value)) return;
-    setBallElasticity(value);
-    elasticitySlider.value = ballElasticity.toFixed(2);
-    updateElasticityLabel();
-  });
-
-  tangentSlider.addEventListener('input', (event) => {
-    const value = parseFloat(event.target.value);
-    if (!Number.isFinite(value)) return;
-    setBallTangentialLoss(value);
-    tangentSlider.value = ballWallTangentLoss.toFixed(2);
-    updateTangentLabel();
-  });
-}
+const BALL_HALF_LIFE_SECONDS = 3.8;  // seconds
+const BALL_ELASTICITY = 0.75;        // wall restitution
+const BALL_WALL_TANGENT_LOSS = 0.10; // 10% tangential loss on wall hits
+const ballDragPerSec = Math.pow(0.5, 1 / BALL_HALF_LIFE_SECONDS);
+const ballStepFriction = Math.pow(ballDragPerSec, DT); // ← applied every fixed step
+const ballElasticity = BALL_ELASTICITY;
+const ballWallTangentLoss = BALL_WALL_TANGENT_LOSS;
 const GOAL_EPS = 0.01;          // plane epsilon to avoid edge flicker
 const GOAL_CORNER_GRACE = 12;    // px vertical grace around goal to prevent corner pop-outs
 // Ball launch speed range for post-reset vertical eject
@@ -421,7 +308,6 @@ const car = {
     ctx.setTransform(1,0,0,1,0,0); ctx.setTransform(dpr,0,0,dpr,0,0);
   }
   addEventListener('resize', fitCanvas); fitCanvas();
-  initPhysicsControls();
 
   // ========================= [STATE: FLOW (START/RESET)] =========================
 addEventListener('keydown', (e) => {
