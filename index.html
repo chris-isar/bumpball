@@ -177,6 +177,16 @@ const AI_FEATURE_SMART_SHOTS  = true;  // far-post & bank planner
 const AI_FEATURE_FINISH_MODE  = true;  // finishing override in attack zone
 const AI_FEATURE_SMART_NUDGE  = true;  // situational, post-contact velocity nudge
 
+// --- AI finishing tunables ---
+const AI_FINISH_GOAL_DEPTH   = 240;  // px from goal line to trigger finish behaviors
+const AI_FINISH_MOUTH_PAD    = 80;   // extra vertical allowance around goal mouth
+const AI_FINISH_CAR_DIST     = 420;  // car must be within this distance of the ball
+const AI_FINISH_WRAP_SPACE   = 120;  // require this much room ahead to allow wrap plays
+const AI_FINISH_BACKOFF_MIN  = 86;   // minimum backoff distance placed behind the ball
+const AI_FINISH_BACKOFF_MAX  = 170;  // maximum backoff distance behind the ball
+const AI_FINISH_SIDE_PULL    = 48;   // lateral pull toward goal center while finishing
+const AI_FINISH_SPEED_RELAX  = 520;  // px/s; slow balls expand the backoff distance
+
 // --- NEW: spawn position tunables ---
 const CAR_SPAWN_X_FRAC = 0.1; // 0.25 = near left goal, 0.5 = center, 0.75 = near right goal
 const CAR_SPAWN_Y_FRAC = 0.50; // vertical center
@@ -1428,6 +1438,12 @@ return { steer, throttle };
   const ballGap = Math.hypot(plan.ballX - aiCar.pos.x, plan.ballY - aiCar.pos.y);
   if (ballGap < 140 && plan.style === 'strike') thr = Math.max(thr, 0.96);
 
+  if (plan.finish) {
+    const finishMin = (absErr < 1.2) ? 0.94 : 0.82;
+    thr = Math.max(thr, finishMin);
+    window._aiFinishBoost = true;
+  }
+
   if (plan.cheat) {
     thr = Math.max(thr, 0.98);
     window._aiFinishBoost = true;
@@ -1581,6 +1597,7 @@ function ai_buildPlanForSample(sample, path, idx, userGoal, goalDir, horizon) {
   let targetX;
   let targetY;
   let style;
+  let finish = false;
 
   if (!behind) {
     const forward = 36 + 28 * speedK;
@@ -1605,13 +1622,42 @@ function ai_buildPlanForSample(sample, path, idx, userGoal, goalDir, horizon) {
     targetY += sample.vy * 0.18;
   }
 
+  if (AI_FEATURE_FINISH_MODE) {
+    const goalPlaneX = (goalDir > 0) ? inner.right : inner.left;
+    const aheadSpace = Math.abs(goalPlaneX - ballX);
+    const mouth = userGoalMouth();
+    const laneTop = mouth.yTop - AI_FINISH_MOUTH_PAD;
+    const laneBot = mouth.yBot + AI_FINISH_MOUTH_PAD;
+    const inLane = (ballY >= laneTop && ballY <= laneBot);
+    const carGap = Math.hypot(ballX - aiCar.pos.x, ballY - aiCar.pos.y);
+    const carAhead = (goalDir > 0) ? (aiCar.pos.x > ballX - 6) : (aiCar.pos.x < ballX + 6);
+    const wrapRoom = aheadSpace > AI_FINISH_WRAP_SPACE;
+    if (aheadSpace < AI_FINISH_GOAL_DEPTH && inLane && carGap < AI_FINISH_CAR_DIST) {
+      if (behind || !wrapRoom || carAhead) {
+        const depthFrac = clamp(1 - aheadSpace / AI_FINISH_GOAL_DEPTH, 0, 1);
+        const speedFrac = clamp(ballSpeed / AI_FINISH_SPEED_RELAX, 0, 1);
+        const backBase = AI_FINISH_BACKOFF_MIN + depthFrac * (AI_FINISH_BACKOFF_MAX - AI_FINISH_BACKOFF_MIN);
+        const backOff = clamp(backBase + (1 - speedFrac) * 32, AI_FINISH_BACKOFF_MIN, AI_FINISH_BACKOFF_MAX);
+        const centerY = (mouth.yTop + mouth.yBot) * 0.5;
+        const spread = Math.max(8, mouth.yBot - mouth.yTop);
+        const sideBlend = clamp((ballY - centerY) / spread, -1, 1);
+        const sideShift = sideBlend * AI_FINISH_SIDE_PULL * (0.55 + 0.45 * depthFrac);
+        targetX = ballX - ugx * backOff;
+        targetY = clamp(ballY - sideShift, mouth.yTop + 16, mouth.yBot - 16);
+        style = 'finish';
+        behind = true;
+        finish = true;
+      }
+    }
+  }
+
   const { hw, hh } = carHalfExtents();
   const margin = Math.max(hw, hh) + 12;
   targetX = clamp(targetX, inner.left + margin, inner.right - margin);
   targetY = clamp(targetY, inner.top + margin, inner.bottom - margin);
 
   let risk = ai_pathWillHitWall(aiCar.pos.x, aiCar.pos.y, targetX, targetY);
-  let adjusted = false;
+  let adjusted = finish;
 
   if (risk) {
     const centerX = (inner.left + inner.right) * 0.5;
@@ -1658,7 +1704,7 @@ function ai_buildPlanForSample(sample, path, idx, userGoal, goalDir, horizon) {
   const maxReach = (AI_TOP_SPEED || CAR_MAX_SPEED) * (sample.t + 0.16);
   const unreachable = dist > (maxReach + 60);
 
-  const cheat = behind && !risk && ballDist < 360 && sample.t < 1.35;
+  const cheat = !finish && behind && !risk && ballDist < 360 && sample.t < 1.35;
 
   return {
     idx,
@@ -1681,6 +1727,7 @@ function ai_buildPlanForSample(sample, path, idx, userGoal, goalDir, horizon) {
     ballDist,
     unreachable,
     bounceType: sample.bouncedX ? 'x' : (sample.bouncedY ? 'y' : null),
+    finish,
     cheat
   };
 }
@@ -1699,6 +1746,14 @@ function ai_scorePlan(plan) {
   if (plan.adjusted) score += 12;
   if (plan.cheat) score += 18;
   if (plan.unreachable) score -= 260;
+
+  if (plan.finish) score += 140;
+
+  if (!plan.finish && !plan.behind) {
+    const goalPlane = (plan.ugx >= 0) ? inner.right : inner.left;
+    const goalDepth = Math.abs(goalPlane - plan.ballX);
+    if (goalDepth < AI_FINISH_GOAL_DEPTH * 0.75) score -= 140;
+  }
 
   if (window._aiLastPlan) {
     if (window._aiLastPlan.idx === plan.idx) score += 22;
@@ -1762,6 +1817,7 @@ function ai_buildFallback(userGoal, goalDir, path) {
     ballDist,
     unreachable: false,
     bounceType: null,
+    finish: false,
     cheat: false,
     fallback: true,
     score: -dist * 0.5 - headingErr * 80
