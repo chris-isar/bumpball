@@ -1396,75 +1396,46 @@ return { steer, throttle };
     return { steer: aiCtl.steer, throttle: aiCtl.throttle };
   }
 
-    // =================== SIMPLE, DECISIVE CONTROLLER (post-first-hit) ===================
-  // One-step ahead intercept, no reverse/escapes, high throttle floor.
+    // =================== SMART CONTROLLER (post-first-hit) ===================
+  const { plan, userGoal, goalDir } = ai_selectPostHitPlan();
 
-  // Goal dir relative to current ball
-  const userGoal = goalCenterForUser();
-  const goalDir  = Math.sign(userGoal.x - probe.x) || 1;
+  const targetX = plan.targetX;
+  const targetY = plan.targetY;
+  window._aiLastTarget = { x: targetX, y: targetY }; // for spinArrestor & pivot assist
 
-  // Predict a single ahead point based on car–ball distance and ball speed
-  const lead = AI_aheadPoint(aiCar.pos.x, aiCar.pos.y, probe.x, probe.y, probe.vx, probe.vy);
-  const bx = lead.x, by = lead.y;
-
-  // Are we behind the ball relative to user's goal?
-  const aiBehindBall = (goalDir > 0) ? (aiCar.pos.x < probe.x) : (aiCar.pos.x > probe.x);
-
-  // Unit vector from (predicted) ball to user's goal
-  const gx = userGoal.x - bx, gy = userGoal.y - by;
-  const gl = Math.hypot(gx, gy) || 1; const ugx = gx/gl, ugy = gy/gl;
-
-  // Tight orbit & through offsets (keep orbit; make the strike go deeper)
-const ORBIT = 102;
-const THROUGH = 160; // deeper strike through the ball (was 46)
-
-  // Choose wrap side using signed area test
-  const side = Math.sign((by - aiCar.pos.y) * ugx - (bx - aiCar.pos.x) * ugy) || 1;
-
-  // Target: wrap if on wrong side, otherwise strike through the ball toward goal
-  let targetX, targetY;
-  if (!aiBehindBall) {
-    targetX = bx - ugx * ORBIT;
-    targetY = by - ugy * (ORBIT * 0.45) + side * 60;
-  } else {
-    targetX = bx - ugx * THROUGH;
-    targetY = by - ugy * THROUGH;
-  }
-
-  // Side-wall bias: if the ball is near a side, aim a little inward
-const SIDE_NEAR = 140;  // distance from side that counts as "near"
-const INSET     = 64;   // how far inside the field we'll aim
-if (probe.x < inner.left + SIDE_NEAR) {
-  if (targetX < inner.left + INSET) targetX = inner.left + INSET;
-} else if (probe.x > inner.right - SIDE_NEAR) {
-  if (targetX > inner.right - INSET) targetX = inner.right - INSET;
-}
-
-  // Keep target inside play bounds
-  const PAD = 28;
-  targetX = clamp(targetX, inner.left + PAD, inner.right - PAD);
-  targetY = clamp(targetY, inner.top  + PAD, inner.bottom - PAD);
-  window._aiLastTarget = { x: targetX, y: targetY }; // for spinArrestor
-
-  // Steering: PD + tiny slip feedforward
+  // Steering: PD + slip feed-forward for stability
   const moveAng = Math.atan2(targetY - aiCar.pos.y, targetX - aiCar.pos.x);
   let err = normalizeAngle(moveAng - aiCar.angle);
   const dErr = (err - (aiCtl.prevErr || 0)) / Math.max(dt, 1e-3);
   aiCtl.prevErr = err;
 
   const slipFF = normalizeAngle(Math.atan2(aiCar.vel.y, aiCar.vel.x) - aiCar.angle);
-  const Kp=1.00, Kd=0.18, Kf=0.08;
-  aiCtl.steer = clamp(Kp*err + Kd*dErr + Kf*slipFF, -1, 1);
+  const Kp = 1.05, Kd = 0.22, Kf = 0.08;
+  aiCtl.steer = clamp(Kp * err + Kd * dErr + Kf * slipFF, -1, 1);
 
-  // Throttle: commit hard; only trim on extreme misalignment
+  // Throttle: push hard, but trim when misaligned or readjusting
   let thr = 1.0;
-  const aerr = Math.abs(err);
-  if (aerr > 1.50)      thr = 0.72;
-  else if (aerr > 1.20) thr = 0.85;
+  const absErr = Math.abs(err);
+  if (absErr > 1.55)      thr = 0.68;
+  else if (absErr > 1.20) thr = 0.84;
 
-  // High floor removes hesitation on long arcs
-  if (thr < 0.92) thr = 0.92;
+  if (plan.dist < 120 && absErr > 1.0) thr = Math.min(thr, 0.60);
+  if (plan.fallback)        thr = Math.min(thr, 0.82);
+  if (plan.readjust)        thr = Math.min(thr, 0.78);
+  if (plan.unreachable)     thr = Math.min(thr, 0.75);
+  if (plan.score < -40)     thr = Math.min(thr, 0.88);
 
+  const ballGap = Math.hypot(plan.ballX - aiCar.pos.x, plan.ballY - aiCar.pos.y);
+  if (ballGap < 140 && plan.style === 'strike') thr = Math.max(thr, 0.96);
+
+  if (plan.cheat) {
+    thr = Math.max(thr, 0.98);
+    window._aiFinishBoost = true;
+  }
+
+  thr = Math.min(1, Math.max(-1, thr));
+
+  aiCtl.headingErr = err;
   aiCtl.throttle = thr;
   return { steer: aiCtl.steer, throttle: aiCtl.throttle };
 }
@@ -1475,6 +1446,8 @@ if (probe.x < inner.left + SIDE_NEAR) {
 if (typeof window._aiPrevContact === 'undefined') window._aiPrevContact = false;
 if (typeof window.aiNudgeFrames  === 'undefined') window.aiNudgeFrames  = 0;
 if (typeof window.aiShotAim      === 'undefined') window.aiShotAim      = {x:0,y:0};
+if (typeof window._aiLastPlan    === 'undefined') window._aiLastPlan    = null;
+if (typeof window._aiReadjusting === 'undefined') window._aiReadjusting = false;
 
 function ai_pickShotAim(){
   const shot = ai_planShot();
@@ -1521,6 +1494,309 @@ function ai_tickNudge(){
   probe.vy = probe.vy * (1 - blend) + dvy * blend;
 
   window.aiNudgeFrames = Math.max(0, window.aiNudgeFrames - 1);
+}
+
+/* === AI: post-first-hit planner === */
+function ai_predictBallPath(maxTime = 2.6, step = 0.12) {
+  const path = [];
+  const left = inner.left + probe.r;
+  const right = inner.right - probe.r;
+  const top = inner.top + probe.r;
+  const bottom = inner.bottom - probe.r;
+
+  let x = probe.x;
+  let y = probe.y;
+  let vx = probe.vx;
+  let vy = probe.vy;
+  let t = 0;
+
+  const tangentKeep = 1 - ballWallTangentLoss;
+  const maxSteps = 80;
+  const safeStep = clamp(step, 1/240, 0.20);
+
+  path.push({ t, x, y, vx, vy, bouncedX: false, bouncedY: false });
+
+  for (let i = 0; i < maxSteps && t < maxTime - 1e-6; i++) {
+    const dt = Math.min(safeStep, maxTime - t);
+    const drag = Math.pow(ballDragPerSec, dt);
+    vx *= drag;
+    vy *= drag;
+    x += vx * dt;
+    y += vy * dt;
+
+    let bouncedX = false;
+    let bouncedY = false;
+
+    if (x < left) { x = left; vx = -vx * ballElasticity; vy *= tangentKeep; bouncedX = true; }
+    else if (x > right) { x = right; vx = -vx * ballElasticity; vy *= tangentKeep; bouncedX = true; }
+
+    if (y < top) { y = top; vy = -vy * ballElasticity; vx *= tangentKeep; bouncedY = true; }
+    else if (y > bottom) { y = bottom; vy = -vy * ballElasticity; vx *= tangentKeep; bouncedY = true; }
+
+    t += dt;
+    path.push({ t, x, y, vx, vy, bouncedX, bouncedY });
+
+    if (Math.hypot(vx, vy) < 5 && t > maxTime * 0.8) break;
+  }
+
+  return path;
+}
+
+function ai_pathWillHitWall(px, py, tx, ty) {
+  const { hw, hh } = carHalfExtents();
+  const margin = Math.max(hw, hh) + 6;
+  const steps = 8;
+  for (let i = 1; i <= steps; i++) {
+    const s = i / steps;
+    const x = px + (tx - px) * s;
+    const y = py + (ty - py) * s;
+    if (x < inner.left + margin || x > inner.right - margin ||
+        y < inner.top + margin  || y > inner.bottom - margin) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function ai_buildPlanForSample(sample, path, idx, userGoal, goalDir, horizon) {
+  const ballX = sample.x;
+  const ballY = sample.y;
+  const toGoalX = userGoal.x - ballX;
+  const toGoalY = userGoal.y - ballY;
+  const goalLen = Math.hypot(toGoalX, toGoalY) || 1;
+  const ugx = toGoalX / goalLen;
+  const ugy = toGoalY / goalLen;
+
+  const side = Math.sign((ballY - aiCar.pos.y) * ugx - (ballX - aiCar.pos.x) * ugy) || 1;
+  const behind = (goalDir > 0) ? (aiCar.pos.x <= ballX - 8) : (aiCar.pos.x >= ballX + 8);
+
+  const ballSpeed = Math.hypot(sample.vx, sample.vy);
+  const speedK = clamp(ballSpeed / 720, 0, 1);
+  const timeFrac = clamp(sample.t / Math.max(0.2, horizon), 0, 1);
+  const orbitDist = 120 + 70 * (1 - timeFrac) + 60 * speedK;
+  const throughDist = 150 + 70 * speedK + 50 * (1 - timeFrac);
+  const tangentX = -ugy;
+  const tangentY = ugx;
+
+  let targetX;
+  let targetY;
+  let style;
+
+  if (!behind) {
+    const forward = 36 + 28 * speedK;
+    targetX = ballX - ugx * forward + tangentX * side * orbitDist;
+    targetY = ballY - ugy * forward + tangentY * side * orbitDist;
+    style = 'wrap';
+  } else {
+    const cheatLead = 0.22 + 0.5 * (1 - timeFrac);
+    targetX = ballX - ugx * throughDist + sample.vx * cheatLead;
+    targetY = ballY - ugy * (throughDist * 0.7) + sample.vy * cheatLead;
+    style = 'strike';
+  }
+
+  if (AI_FEATURE_SMART_SHOTS) {
+    const farY = farPostY(ballY);
+    const postBias = clamp((farY - ballY) / 360, -0.7, 0.7);
+    targetY += postBias * 32;
+  }
+
+  if (sample.bouncedX || sample.bouncedY) {
+    targetX += sample.vx * 0.18;
+    targetY += sample.vy * 0.18;
+  }
+
+  const { hw, hh } = carHalfExtents();
+  const margin = Math.max(hw, hh) + 12;
+  targetX = clamp(targetX, inner.left + margin, inner.right - margin);
+  targetY = clamp(targetY, inner.top + margin, inner.bottom - margin);
+
+  let risk = ai_pathWillHitWall(aiCar.pos.x, aiCar.pos.y, targetX, targetY);
+  let adjusted = false;
+
+  if (risk) {
+    const centerX = (inner.left + inner.right) * 0.5;
+    const centerY = (inner.top + inner.bottom) * 0.5;
+    const adjustX = clamp(lerp(targetX, centerX, 0.45), inner.left + margin, inner.right - margin);
+    const adjustY = clamp(lerp(targetY, centerY, 0.45), inner.top + margin, inner.bottom - margin);
+    if (!ai_pathWillHitWall(aiCar.pos.x, aiCar.pos.y, adjustX, adjustY)) {
+      targetX = adjustX;
+      targetY = adjustY;
+      risk = false;
+      adjusted = true;
+    }
+  }
+
+  if (risk) {
+    const slideX = clamp(targetX + tangentX * side * 90, inner.left + margin, inner.right - margin);
+    const slideY = clamp(targetY + tangentY * side * 90, inner.top + margin, inner.bottom - margin);
+    if (!ai_pathWillHitWall(aiCar.pos.x, aiCar.pos.y, slideX, slideY)) {
+      targetX = slideX;
+      targetY = slideY;
+      risk = false;
+      adjusted = true;
+    }
+  }
+
+  if (risk && path[idx + 1]) {
+    const next = path[idx + 1];
+    const altX = next.x - ugx * (behind ? throughDist * 0.8 : orbitDist * 0.6);
+    const altY = next.y - ugy * (behind ? throughDist * 0.5 : orbitDist * 0.5);
+    const clampedX = clamp(altX, inner.left + margin, inner.right - margin);
+    const clampedY = clamp(altY, inner.top + margin, inner.bottom - margin);
+    if (!ai_pathWillHitWall(aiCar.pos.x, aiCar.pos.y, clampedX, clampedY)) {
+      targetX = clampedX;
+      targetY = clampedY;
+      risk = false;
+      adjusted = true;
+    }
+  }
+
+  const dist = Math.hypot(targetX - aiCar.pos.x, targetY - aiCar.pos.y);
+  const moveAng = Math.atan2(targetY - aiCar.pos.y, targetX - aiCar.pos.x);
+  const headingErr = Math.abs(normalizeAngle(moveAng - aiCar.angle));
+  const ballDist = Math.hypot(ballX - aiCar.pos.x, ballY - aiCar.pos.y);
+  const maxReach = (AI_TOP_SPEED || CAR_MAX_SPEED) * (sample.t + 0.16);
+  const unreachable = dist > (maxReach + 60);
+
+  const cheat = behind && !risk && ballDist < 360 && sample.t < 1.35;
+
+  return {
+    idx,
+    t: sample.t,
+    ballX,
+    ballY,
+    ballVX: sample.vx,
+    ballVY: sample.vy,
+    ugx,
+    ugy,
+    side,
+    behind,
+    style,
+    targetX,
+    targetY,
+    risk,
+    adjusted,
+    dist,
+    headingErr,
+    ballDist,
+    unreachable,
+    bounceType: sample.bouncedX ? 'x' : (sample.bouncedY ? 'y' : null),
+    cheat
+  };
+}
+
+function ai_scorePlan(plan) {
+  let score = 0;
+  score -= plan.t * 220;
+  score -= plan.dist * 0.55;
+  score -= plan.headingErr * 120;
+  score -= plan.ballDist * 0.1;
+
+  if (plan.behind) score += 120;
+  if (plan.style === 'strike') score += 40;
+  if (plan.bounceType) score += 28;
+  if (!plan.risk) score += 90;
+  if (plan.adjusted) score += 12;
+  if (plan.cheat) score += 18;
+  if (plan.unreachable) score -= 260;
+
+  if (window._aiLastPlan) {
+    if (window._aiLastPlan.idx === plan.idx) score += 22;
+    const deltaX = Math.abs(window._aiLastPlan.targetX - plan.targetX);
+    const deltaY = Math.abs(window._aiLastPlan.targetY - plan.targetY);
+    if (deltaX < 42 && deltaY < 42) score += 15;
+  }
+
+  const velLen = Math.hypot(plan.ballVX, plan.ballVY);
+  if (velLen > 1) {
+    const dirDot = (plan.ballVX * plan.ugx + plan.ballVY * plan.ugy) / velLen;
+    score += dirDot * 35;
+  }
+
+  if (plan.t < 0.5) score += 40;
+  else if (plan.t > 1.8) score -= 40;
+
+  return score;
+}
+
+function ai_buildFallback(userGoal, goalDir, path) {
+  const { hw, hh } = carHalfExtents();
+  const margin = Math.max(hw, hh) + 12;
+  let anchorX = probe.x - goalDir * 220;
+  let anchorY = probe.y;
+
+  if (Array.isArray(path)) {
+    const bounce = path.find((s, i) => i > 0 && (s.bouncedX || s.bouncedY));
+    if (bounce) {
+      anchorX = bounce.x - goalDir * 160;
+      anchorY = bounce.y;
+    }
+  }
+
+  anchorX = clamp(anchorX, inner.left + margin, inner.right - margin);
+  anchorY = clamp(anchorY, inner.top + margin, inner.bottom - margin);
+
+  const dist = Math.hypot(anchorX - aiCar.pos.x, anchorY - aiCar.pos.y);
+  const moveAng = Math.atan2(anchorY - aiCar.pos.y, anchorX - aiCar.pos.x);
+  const headingErr = Math.abs(normalizeAngle(moveAng - aiCar.angle));
+  const ballDist = Math.hypot(probe.x - aiCar.pos.x, probe.y - aiCar.pos.y);
+
+  return {
+    idx: -1,
+    t: 0.85,
+    ballX: probe.x,
+    ballY: probe.y,
+    ballVX: probe.vx,
+    ballVY: probe.vy,
+    ugx: Math.sign(userGoal.x - probe.x) || 1,
+    ugy: 0,
+    side: 0,
+    behind: true,
+    style: 'fallback',
+    targetX: anchorX,
+    targetY: anchorY,
+    risk: false,
+    adjusted: false,
+    dist,
+    headingErr,
+    ballDist,
+    unreachable: false,
+    bounceType: null,
+    cheat: false,
+    fallback: true,
+    score: -dist * 0.5 - headingErr * 80
+  };
+}
+
+function ai_selectPostHitPlan() {
+  const horizon = 2.6;
+  const step = 0.11;
+  const path = ai_predictBallPath(horizon, step);
+  const userGoal = goalCenterForUser();
+  const goalDir = Math.sign(userGoal.x - probe.x) || 1;
+
+  let best = null;
+  for (let i = 1; i < path.length; i++) {
+    const sample = path[i];
+    if (!isFinite(sample.x) || !isFinite(sample.y)) continue;
+    const plan = ai_buildPlanForSample(sample, path, i, userGoal, goalDir, horizon);
+    if (!plan) continue;
+    plan.score = ai_scorePlan(plan);
+    if (!best || plan.score > best.score) best = plan;
+  }
+
+  if (!best || best.unreachable || best.risk || best.score < -60) {
+    const fallback = ai_buildFallback(userGoal, goalDir, path);
+    fallback.readjust = true;
+    best = fallback;
+  } else {
+    best.readjust = false;
+  }
+
+  window._aiLastPlan = best;
+  window._aiReadjusting = !!best.readjust;
+
+  return { plan: best, userGoal, goalDir };
 }
 
 /* === AI-only pivot assist (post-first-hit) === */
@@ -1687,7 +1963,10 @@ function updateFixed(dt) {
 
   // Accel in heading (allow reverse for braking; computeAIControls already suppresses during kickoff window)
   const aiCos = Math.cos(aiCar.angle), aiSin = Math.sin(aiCar.angle);
-  const accelMagAI = aiThrottle >= 0 ? CAR_ACCEL : CAR_REVERSE_ACCEL;
+  let accelMagAI = aiThrottle >= 0 ? CAR_ACCEL : CAR_REVERSE_ACCEL;
+  if (window._aiFinishBoost && aiThrottle > 0.6) {
+    accelMagAI *= 1.08;
+  }
   aiCar.vel.x += aiCos * (accelMagAI * aiThrottle) * dt;
   aiCar.vel.y += aiSin * (accelMagAI * aiThrottle) * dt;
 
@@ -1769,8 +2048,8 @@ ai_pivotAssist(dt);
     aiCar.pos.x = rr.px; aiCar.pos.y = rr.py; aiCar.vel.x = rr.vx; aiCar.vel.y = rr.vy;
   }
 
-  // Top speed cap for AI (let AI exceed player cap intentionally)
-	const cap = AI_TOP_SPEED;
+  // Top speed cap for AI (allow subtle finish boost when enabled)
+        const cap = (window._aiFinishBoost && aiThrottle > 0.6) ? AI_TOP_SPEED * 1.04 : AI_TOP_SPEED;
   const aiSp2 = Math.hypot(aiCar.vel.x, aiCar.vel.y);
   if (aiSp2 > cap) { const s = cap / aiSp2; aiCar.vel.x *= s; aiCar.vel.y *= s; }
 
